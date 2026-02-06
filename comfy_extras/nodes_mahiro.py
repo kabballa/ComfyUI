@@ -20,6 +20,7 @@ class Mahiro(io.ComfyNode):
                 io.Model.Output(display_name="patched_model"),
             ],
             is_experimental=True,
+            search_aliases=["mahiro", "mahiro cfg"],
         )
 
     @classmethod
