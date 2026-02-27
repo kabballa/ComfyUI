@@ -350,7 +350,7 @@ AMD_ENABLE_MIOPEN_ENV = 'COMFYUI_ENABLE_MIOPEN'
 
 try:
     if is_amd():
-        arch = torch.cuda.get_device_properties(get_torch_device()).gcnArchName.split(':')[0]
+        arch = torch.cuda.get_device_properties(get_torch_device()).gcnArchName
         if not (any((a in arch) for a in AMD_RDNA2_AND_OLDER_ARCH)):
             if os.getenv(AMD_ENABLE_MIOPEN_ENV) != '1':
                 torch.backends.cudnn.enabled = False  # Seems to improve things a lot on AMD
@@ -378,7 +378,7 @@ try:
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
             if aotriton_supported(arch):  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
-                    if any((a in arch) for a in ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1151"]):  # TODO: more arches, TODO: gfx950
+                    if any((a in arch) for a in ["gfx90a", "gfx942", "gfx1100", "gfx1101", "gfx1151"]):  # TODO: more arches, TODO: gfx950
                         ENABLE_PYTORCH_ATTENTION = True
                 if rocm_version >= (7, 0):
                    if any((a in arch) for a in ["gfx1200", "gfx1201"]):
@@ -570,7 +570,13 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
-        return self.real_model() is not None and self.model is None
+        # Model is dead if the weakref to model has been garbage collected
+        # This can happen with ModelPatcherProxy objects between isolated workflows
+        if self.model is None:
+            return True
+        if self.real_model is None:
+            return False
+        return self.real_model() is None
 
 
 def use_more_memory(extra_memory, loaded_models, device):
@@ -616,6 +622,7 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
     unloaded_model = []
     can_unload = []
     unloaded_models = []
+    isolation_active = os.environ.get("PYISOLATE_ISOLATION_ACTIVE") == "1"
 
     for i in range(len(current_loaded_models) -1, -1, -1):
         shift_model = current_loaded_models[i]
@@ -623,6 +630,17 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
             if shift_model not in keep_loaded and not shift_model.is_dead():
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
+
+    if can_unload and isolation_active:
+        try:
+            from pyisolate import flush_tensor_keeper  # type: ignore[attr-defined]
+        except Exception:
+            flush_tensor_keeper = None
+        if callable(flush_tensor_keeper):
+            flushed = flush_tensor_keeper()
+            if flushed > 0:
+                logging.debug("][ MM:tensor_keeper_flush | released=%d", flushed)
+                gc.collect()
 
     for x in sorted(can_unload):
         i = x[-1]
@@ -645,7 +663,13 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
             current_loaded_models[i].model.partially_unload_ram(ram_to_free)
 
     for i in sorted(unloaded_model, reverse=True):
-        unloaded_models.append(current_loaded_models.pop(i))
+        unloaded = current_loaded_models.pop(i)
+        model_obj = unloaded.model
+        if model_obj is not None:
+            cleanup = getattr(model_obj, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+        unloaded_models.append(unloaded)
 
     if len(unloaded_model) > 0:
         soft_empty_cache()
@@ -767,25 +791,28 @@ def loaded_models(only_currently_used=False):
 
 
 def cleanup_models_gc():
-    do_gc = False
-
     reset_cast_buffers()
-
+    dead_found = False
     for i in range(len(current_loaded_models)):
-        cur = current_loaded_models[i]
-        if cur.is_dead():
-            logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
-            do_gc = True
+        if current_loaded_models[i].is_dead():
+            dead_found = True
             break
 
-    if do_gc:
+    if dead_found:
+        logging.info("Potential memory leak detected with model NoneType, doing a full garbage collect, for maximum performance avoid circular references in the model code.")
         gc.collect()
         soft_empty_cache()
 
-        for i in range(len(current_loaded_models)):
+        for i in range(len(current_loaded_models) - 1, -1, -1):
             cur = current_loaded_models[i]
             if cur.is_dead():
-                logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
+                logging.warning("WARNING, memory leak with model NoneType. Please make sure it is not being referenced from somewhere.")
+                leaked = current_loaded_models.pop(i)
+                model_obj = getattr(leaked, "model", None)
+                if model_obj is not None:
+                    cleanup = getattr(model_obj, "cleanup", None)
+                    if callable(cleanup):
+                        cleanup()
 
 
 def archive_model_dtypes(model):
@@ -802,6 +829,11 @@ def cleanup_models():
 
     for i in to_delete:
         x = current_loaded_models.pop(i)
+        model_obj = getattr(x, "model", None)
+        if model_obj is not None:
+            cleanup = getattr(model_obj, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
         del x
 
 def dtype_size(dtype):
