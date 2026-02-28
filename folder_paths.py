@@ -481,7 +481,15 @@ def get_model_placeholder(folder_name: str) -> str:
     Returns:
         A user-friendly placeholder string indicating where models should be placed.
     """
-    return f"No models found in ComfyUI/models/{folder_name} folder..."
+    folder_name = map_legacy(folder_name)
+    try:
+        paths = get_folder_paths(folder_name)
+    except KeyError:
+        paths = []
+
+    if paths:
+        return f"No models found — add to: {paths[0]}"
+    return f"No models found for '{folder_name}'..."
 
 
 def get_input_subfolders() -> list[str]:
