@@ -137,11 +137,18 @@ class Caching:
     """
     # Public types — defined in comfy_api.latest._caching (source of truth)
     from ._caching import CacheProvider, CacheContext, CacheValue
-    # Registry functions — implementation in comfy_execution
-    from comfy_execution.cache_provider import (
-        register_cache_provider as register_provider,
-        unregister_cache_provider as unregister_provider,
-    )
+
+    @staticmethod
+    def register_provider(provider: "Caching.CacheProvider") -> None:
+        """Register an external cache provider."""
+        from comfy_execution.cache_provider import register_cache_provider
+        register_cache_provider(provider)
+
+    @staticmethod
+    def unregister_provider(provider: "Caching.CacheProvider") -> None:
+        """Unregister an external cache provider."""
+        from comfy_execution.cache_provider import unregister_cache_provider
+        unregister_cache_provider(provider)
 
 
 ComfyAPI = ComfyAPI_latest
