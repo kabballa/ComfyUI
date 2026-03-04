@@ -1233,7 +1233,11 @@ class PromptServer():
         return json_data
 
     def send_progress_text(
-        self, text: Union[bytes, bytearray, str], node_id: str, prompt_id: Optional[str] = None, sid=None
+        self,
+        text: Union[bytes, bytearray, str],
+        node_id: str,
+        prompt_id: Optional[str] = None,
+        sid=None,
     ):
         """Send a progress text message to the client via WebSocket.
 
@@ -1251,15 +1255,15 @@ class PromptServer():
             text = text.encode("utf-8")
         node_id_bytes = str(node_id).encode("utf-8")
 
-        # When prompt_id is provided and client supports the new format,
-        # prepend prompt_id as a length-prefixed field before node_id
+        # Auto-resolve sid to the currently executing client
         target_sid = sid if sid is not None else self.client_id
+
+        # When prompt_id is available and client supports the new format,
+        # prepend prompt_id as a length-prefixed field before node_id
         if prompt_id and feature_flags.supports_feature(
             self.sockets_metadata, target_sid, "supports_progress_text_metadata"
         ):
             prompt_id_bytes = prompt_id.encode("utf-8")
-            # Pack prompt_id length as a 4-byte unsigned integer, followed by prompt_id bytes,
-            # then node_id length as a 4-byte unsigned integer, followed by node_id bytes, then text
             message = (
                 struct.pack(">I", len(prompt_id_bytes))
                 + prompt_id_bytes
@@ -1268,7 +1272,6 @@ class PromptServer():
                 + text
             )
         else:
-            # Pack the node_id length as a 4-byte unsigned integer, followed by the node_id bytes
             message = struct.pack(">I", len(node_id_bytes)) + node_id_bytes + text
 
-        self.send_sync(BinaryEventTypes.TEXT, message, sid)
+        self.send_sync(BinaryEventTypes.TEXT, message, target_sid)
