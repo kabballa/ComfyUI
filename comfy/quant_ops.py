@@ -1,33 +1,38 @@
 import torch
 import logging
+from comfy.cli_args import args
 
-try:
-    import comfy_kitchen as ck
-    from comfy_kitchen.tensor import (
-        QuantizedTensor,
-        QuantizedLayout,
-        TensorCoreFP8Layout as _CKFp8Layout,
-        TensorCoreNVFP4Layout as _CKNvfp4Layout,
-        register_layout_op,
-        register_layout_class,
-        get_layout_class,
-    )
-    _CK_AVAILABLE = True
-    if torch.version.cuda is None:
-        ck.registry.disable("cuda")
-    else:
-        cuda_version = tuple(map(int, str(torch.version.cuda).split('.')))
-        if cuda_version < (13,):
-            ck.registry.disable("cuda")
-            logging.warning("WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.")
-
-    ck.registry.disable("triton")
-    for k, v in ck.list_backends().items():
-        logging.info(f"Found comfy_kitchen backend {k}: {v}")
-except ImportError as e:
-    logging.error(f"Failed to import comfy_kitchen, Error: {e}, fp8 and fp4 support will not be available.")
+if args.cpu:
     _CK_AVAILABLE = False
+else:
+    try:
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import (
+            QuantizedTensor,
+            QuantizedLayout,
+            TensorCoreFP8Layout as _CKFp8Layout,
+            TensorCoreNVFP4Layout as _CKNvfp4Layout,
+            register_layout_op,
+            register_layout_class,
+            get_layout_class,
+        )
+        _CK_AVAILABLE = True
+        if torch.version.cuda is None:
+            ck.registry.disable("cuda")
+        else:
+            cuda_version = tuple(map(int, str(torch.version.cuda).split('.')))
+            if cuda_version < (13,):
+                ck.registry.disable("cuda")
+                logging.warning("WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.")
 
+        ck.registry.disable("triton")
+        for k, v in ck.list_backends().items():
+            logging.info(f"Found comfy_kitchen backend {k}: {v}")
+    except ImportError as e:
+        logging.error(f"Failed to import comfy_kitchen, Error: {e}, fp8 and fp4 support will not be available.")
+        _CK_AVAILABLE = False
+
+if not _CK_AVAILABLE:
     class QuantizedTensor:
         pass
 
