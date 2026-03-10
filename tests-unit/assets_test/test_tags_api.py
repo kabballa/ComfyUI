@@ -97,7 +97,7 @@ def test_add_and_remove_tags(http: requests.Session, api_base: str, seeded_asset
     # normalized, deduplicated; 'unit-tests' was already present from the seed
     assert set(b1["added"]) == {"newtag", "beta"}
     assert set(b1["already_present"]) == {"unit-tests"}
-    assert "newtag" in b1["total_tags"] and "beta" in b1["total_tags"]
+    assert "newtag" in b1["tags"] and "beta" in b1["tags"]
 
     rg = http.get(f"{api_base}/api/assets/{aid}", timeout=120)
     g = rg.json()

@@ -24,6 +24,8 @@ from app.assets.database.models import (
 )
 from app.assets.database.queries.common import (
     MAX_BIND_PARAMS,
+    apply_metadata_filter,
+    apply_tag_filters,
     build_prefix_like_conditions,
     build_visible_owner_clause,
     calculate_rows_per_statement,
@@ -79,83 +81,6 @@ def convert_metadata_to_rows(key: str, value) -> list[dict]:
     return [{"key": key, "ordinal": 0, "val_json": value}]
 
 
-def _apply_tag_filters(
-    stmt: sa.sql.Select,
-    include_tags: Sequence[str] | None = None,
-    exclude_tags: Sequence[str] | None = None,
-) -> sa.sql.Select:
-    """include_tags: every tag must be present; exclude_tags: none may be present."""
-    include_tags = normalize_tags(include_tags)
-    exclude_tags = normalize_tags(exclude_tags)
-
-    if include_tags:
-        for tag_name in include_tags:
-            stmt = stmt.where(
-                exists().where(
-                    (AssetReferenceTag.asset_reference_id == AssetReference.id)
-                    & (AssetReferenceTag.tag_name == tag_name)
-                )
-            )
-
-    if exclude_tags:
-        stmt = stmt.where(
-            ~exists().where(
-                (AssetReferenceTag.asset_reference_id == AssetReference.id)
-                & (AssetReferenceTag.tag_name.in_(exclude_tags))
-            )
-        )
-    return stmt
-
-
-def _apply_metadata_filter(
-    stmt: sa.sql.Select,
-    metadata_filter: dict | None = None,
-) -> sa.sql.Select:
-    """Apply filters using asset_reference_meta projection table."""
-    if not metadata_filter:
-        return stmt
-
-    def _exists_for_pred(key: str, *preds) -> sa.sql.ClauseElement:
-        return sa.exists().where(
-            AssetReferenceMeta.asset_reference_id == AssetReference.id,
-            AssetReferenceMeta.key == key,
-            *preds,
-        )
-
-    def _exists_clause_for_value(key: str, value) -> sa.sql.ClauseElement:
-        if value is None:
-            no_row_for_key = sa.not_(
-                sa.exists().where(
-                    AssetReferenceMeta.asset_reference_id == AssetReference.id,
-                    AssetReferenceMeta.key == key,
-                )
-            )
-            null_row = _exists_for_pred(
-                key,
-                AssetReferenceMeta.val_json.is_(None),
-                AssetReferenceMeta.val_str.is_(None),
-                AssetReferenceMeta.val_num.is_(None),
-                AssetReferenceMeta.val_bool.is_(None),
-            )
-            return sa.or_(no_row_for_key, null_row)
-
-        if isinstance(value, bool):
-            return _exists_for_pred(key, AssetReferenceMeta.val_bool == bool(value))
-        if isinstance(value, (int, float, Decimal)):
-            num = value if isinstance(value, Decimal) else Decimal(str(value))
-            return _exists_for_pred(key, AssetReferenceMeta.val_num == num)
-        if isinstance(value, str):
-            return _exists_for_pred(key, AssetReferenceMeta.val_str == value)
-        return _exists_for_pred(key, AssetReferenceMeta.val_json == value)
-
-    for k, v in metadata_filter.items():
-        if isinstance(v, list):
-            ors = [_exists_clause_for_value(k, elem) for elem in v]
-            if ors:
-                stmt = stmt.where(sa.or_(*ors))
-        else:
-            stmt = stmt.where(_exists_clause_for_value(k, v))
-    return stmt
 
 
 def get_reference_by_id(
@@ -336,8 +261,8 @@ def list_references_page(
         escaped, esc = escape_sql_like_string(name_contains)
         base = base.where(AssetReference.name.ilike(f"%{escaped}%", escape=esc))
 
-    base = _apply_tag_filters(base, include_tags, exclude_tags)
-    base = _apply_metadata_filter(base, metadata_filter)
+    base = apply_tag_filters(base, include_tags, exclude_tags)
+    base = apply_metadata_filter(base, metadata_filter)
 
     sort = (sort or "created_at").lower()
     order = (order or "desc").lower()
@@ -366,8 +291,8 @@ def list_references_page(
         count_stmt = count_stmt.where(
             AssetReference.name.ilike(f"%{escaped}%", escape=esc)
         )
-    count_stmt = _apply_tag_filters(count_stmt, include_tags, exclude_tags)
-    count_stmt = _apply_metadata_filter(count_stmt, metadata_filter)
+    count_stmt = apply_tag_filters(count_stmt, include_tags, exclude_tags)
+    count_stmt = apply_metadata_filter(count_stmt, metadata_filter)
 
     total = int(session.execute(count_stmt).scalar_one() or 0)
     refs = session.execute(base).unique().scalars().all()

@@ -8,12 +8,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.assets.database.models import (
+    Asset,
     AssetReference,
     AssetReferenceMeta,
     AssetReferenceTag,
     Tag,
 )
 from app.assets.database.queries.common import (
+    apply_metadata_filter,
+    apply_tag_filters,
     build_visible_owner_clause,
     iter_row_chunks,
 )
@@ -318,6 +321,53 @@ def list_tags_with_usage(
 
     rows_norm = [(name, ttype, int(count or 0)) for (name, ttype, count) in rows]
     return rows_norm, int(total or 0)
+
+
+def list_tag_counts_for_filtered_assets(
+    session: Session,
+    owner_id: str = "",
+    include_tags: Sequence[str] | None = None,
+    exclude_tags: Sequence[str] | None = None,
+    name_contains: str | None = None,
+    metadata_filter: dict | None = None,
+    limit: int = 100,
+) -> dict[str, int]:
+    """Return tag counts for assets matching the given filters.
+
+    Uses the same filtering logic as list_references_page but returns
+    {tag_name: count} instead of paginated references.
+    """
+    # Build a subquery of matching reference IDs
+    ref_sq = (
+        select(AssetReference.id)
+        .join(Asset, Asset.id == AssetReference.asset_id)
+        .where(build_visible_owner_clause(owner_id))
+        .where(AssetReference.is_missing == False)  # noqa: E712
+        .where(AssetReference.deleted_at.is_(None))
+    )
+
+    if name_contains:
+        escaped, esc = escape_sql_like_string(name_contains)
+        ref_sq = ref_sq.where(AssetReference.name.ilike(f"%{escaped}%", escape=esc))
+
+    ref_sq = apply_tag_filters(ref_sq, include_tags, exclude_tags)
+    ref_sq = apply_metadata_filter(ref_sq, metadata_filter)
+    ref_sq = ref_sq.subquery()
+
+    # Count tags across those references
+    q = (
+        select(
+            AssetReferenceTag.tag_name,
+            func.count(AssetReferenceTag.asset_reference_id).label("cnt"),
+        )
+        .where(AssetReferenceTag.asset_reference_id.in_(select(ref_sq.c.id)))
+        .group_by(AssetReferenceTag.tag_name)
+        .order_by(func.count(AssetReferenceTag.asset_reference_id).desc())
+        .limit(limit)
+    )
+
+    rows = session.execute(q).all()
+    return {tag_name: int(cnt) for tag_name, cnt in rows}
 
 
 def bulk_insert_tags_and_meta(

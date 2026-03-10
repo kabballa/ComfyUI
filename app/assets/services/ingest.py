@@ -18,6 +18,7 @@ from app.assets.database.queries import (
     remove_missing_tag_for_asset_id,
     set_reference_metadata,
     set_reference_tags,
+    update_asset_hash_and_mime,
     upsert_asset,
     upsert_reference,
     validate_tags_exist,
@@ -242,6 +243,9 @@ def upload_from_temp_path(
     client_filename: str | None = None,
     owner_id: str = "",
     expected_hash: str | None = None,
+    mime_type: str | None = None,
+    preview_id: str | None = None,
+    asset_id: str | None = None,
 ) -> UploadResult:
     try:
         digest, _ = hashing.compute_blake3_hash(temp_path)
@@ -291,7 +295,7 @@ def upload_from_temp_path(
     dest_abs = os.path.abspath(os.path.join(dest_dir, hashed_basename))
     validate_path_within_base(dest_abs, base_dir)
 
-    content_type = (
+    content_type = mime_type or (
         mimetypes.guess_type(os.path.basename(src_for_ext), strict=False)[0]
         or mimetypes.guess_type(hashed_basename, strict=False)[0]
         or "application/octet-stream"
@@ -315,7 +319,7 @@ def upload_from_temp_path(
         mime_type=content_type,
         info_name=_sanitize_filename(name or client_filename, fallback=digest),
         owner_id=owner_id,
-        preview_id=None,
+        preview_id=preview_id,
         user_metadata=user_metadata or {},
         tags=tags,
         tag_origin="manual",
@@ -348,6 +352,7 @@ def create_from_hash(
     tags: list[str] | None = None,
     user_metadata: dict | None = None,
     owner_id: str = "",
+    mime_type: str | None = None,
 ) -> UploadResult | None:
     canonical = hash_str.strip().lower()
 
@@ -355,6 +360,10 @@ def create_from_hash(
         asset = get_asset_by_hash(session, asset_hash=canonical)
         if not asset:
             return None
+
+        if mime_type and asset.mime_type != mime_type:
+            update_asset_hash_and_mime(session, asset_id=asset.id, mime_type=mime_type)
+            session.commit()
 
     result = _register_existing_asset(
         asset_hash=canonical,

@@ -23,9 +23,11 @@ class ReferenceData:
     file_path: str | None
     user_metadata: UserMetadata
     preview_id: str | None
-    created_at: datetime
-    updated_at: datetime
-    last_access_time: datetime | None
+    system_metadata: dict[str, Any] | None = None
+    prompt_id: str | None = None
+    created_at: datetime = None  # type: ignore[assignment]
+    updated_at: datetime = None  # type: ignore[assignment]
+    last_access_time: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,8 @@ def extract_reference_data(ref: AssetReference) -> ReferenceData:
         file_path=ref.file_path,
         user_metadata=ref.user_metadata,
         preview_id=ref.preview_id,
+        system_metadata=ref.system_metadata,
+        prompt_id=ref.prompt_id,
         created_at=ref.created_at,
         updated_at=ref.updated_at,
         last_access_time=ref.last_access_time,
