@@ -255,7 +255,7 @@ async def get_asset_route(request: web.Request) -> web.Response:
             USER_MANAGER.get_request_user_id(request),
         )
         return _build_error_response(500, "INTERNAL", "Unexpected server error.")
-    return web.json_response(payload.model_dump(mode="json"), status=200)
+    return web.json_response(payload.model_dump(mode="json", exclude_none=True), status=200)
 
 
 @ROUTES.get(f"/api/assets/{{id:{UUID_RE}}}/content")
@@ -526,7 +526,7 @@ async def update_asset_route(request: web.Request) -> web.Response:
             USER_MANAGER.get_request_user_id(request),
         )
         return _build_error_response(500, "INTERNAL", "Unexpected server error.")
-    return web.json_response(payload.model_dump(mode="json"), status=200)
+    return web.json_response(payload.model_dump(mode="json", exclude_none=True), status=200)
 
 
 @ROUTES.delete(f"/api/assets/{{id:{UUID_RE}}}")
@@ -595,7 +595,7 @@ async def get_tags(request: web.Request) -> web.Response:
     payload = schemas_out.TagsList(
         tags=tags, total=total, has_more=(query.offset + len(tags)) < total
     )
-    return web.json_response(payload.model_dump(mode="json"))
+    return web.json_response(payload.model_dump(mode="json", exclude_none=True))
 
 
 @ROUTES.post(f"/api/assets/{{id:{UUID_RE}}}/tags")
@@ -643,7 +643,7 @@ async def add_asset_tags(request: web.Request) -> web.Response:
         )
         return _build_error_response(500, "INTERNAL", "Unexpected server error.")
 
-    return web.json_response(payload.model_dump(mode="json"), status=200)
+    return web.json_response(payload.model_dump(mode="json", exclude_none=True), status=200)
 
 
 @ROUTES.delete(f"/api/assets/{{id:{UUID_RE}}}/tags")
@@ -690,7 +690,7 @@ async def delete_asset_tags(request: web.Request) -> web.Response:
         )
         return _build_error_response(500, "INTERNAL", "Unexpected server error.")
 
-    return web.json_response(payload.model_dump(mode="json"), status=200)
+    return web.json_response(payload.model_dump(mode="json", exclude_none=True), status=200)
 
 
 @ROUTES.get("/api/assets/tags/refine")
@@ -712,7 +712,7 @@ async def get_tags_refine(request: web.Request) -> web.Response:
         limit=q.limit,
     )
     payload = schemas_out.TagHistogram(tag_counts=tag_counts)
-    return web.json_response(payload.model_dump(mode="json"), status=200)
+    return web.json_response(payload.model_dump(mode="json", exclude_none=True), status=200)
 
 
 @ROUTES.post("/api/assets/seed")
