@@ -54,14 +54,14 @@ class TagsAdd(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     added: list[str] = Field(default_factory=list)
     already_present: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
+    total_tags: list[str] = Field(default_factory=list)
 
 
 class TagsRemove(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     removed: list[str] = Field(default_factory=list)
     not_present: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
+    total_tags: list[str] = Field(default_factory=list)
 
 
 class TagHistogram(BaseModel):

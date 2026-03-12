@@ -152,7 +152,14 @@ def _build_preview_url_from_view(tags: list[str], user_metadata: dict[str, Any] 
 
 def _build_asset_response(result: schemas.AssetDetailResult | schemas.UploadResult) -> schemas_out.Asset:
     """Build an Asset response from a service result."""
-    preview_url = _build_preview_url_from_view(result.tags, result.ref.user_metadata)
+    if result.ref.preview_id:
+        preview_detail = get_asset_detail(result.ref.preview_id)
+        if preview_detail:
+            preview_url = _build_preview_url_from_view(preview_detail.tags, preview_detail.ref.user_metadata)
+        else:
+            preview_url = None
+    else:
+        preview_url = _build_preview_url_from_view(result.tags, result.ref.user_metadata)
     return schemas_out.Asset(
         id=result.ref.id,
         name=result.ref.name,
@@ -382,7 +389,6 @@ async def upload_asset(request: web.Request) -> web.Response:
                 "name": parsed.provided_name,
                 "user_metadata": parsed.user_metadata_raw,
                 "hash": parsed.provided_hash,
-                "id": parsed.provided_id,
                 "mime_type": parsed.provided_mime_type,
                 "preview_id": parsed.provided_preview_id,
             }
@@ -605,7 +611,7 @@ async def add_asset_tags(request: web.Request) -> web.Response:
         payload = schemas_out.TagsAdd(
             added=result.added,
             already_present=result.already_present,
-            tags=result.total_tags,
+            total_tags=result.total_tags,
         )
     except PermissionError as pe:
         return _build_error_response(403, "FORBIDDEN", str(pe), {"id": reference_id})
@@ -652,7 +658,7 @@ async def delete_asset_tags(request: web.Request) -> web.Response:
         payload = schemas_out.TagsRemove(
             removed=result.removed,
             not_present=result.not_present,
-            tags=result.total_tags,
+            total_tags=result.total_tags,
         )
     except PermissionError as pe:
         return _build_error_response(403, "FORBIDDEN", str(pe), {"id": reference_id})

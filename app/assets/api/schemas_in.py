@@ -45,7 +45,6 @@ class ParsedUpload:
     user_metadata_raw: str | None
     provided_hash: str | None
     provided_hash_exists: bool | None
-    provided_id: str | None = None
     provided_mime_type: str | None = None
     provided_preview_id: str | None = None
 
