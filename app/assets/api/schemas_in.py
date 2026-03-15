@@ -100,17 +100,16 @@ class ListAssetsQuery(BaseModel):
 class UpdateAssetBody(BaseModel):
     name: str | None = None
     user_metadata: dict[str, Any] | None = None
-    mime_type: str | None = None
     preview_id: str | None = None  # references an asset_reference id, not an asset id
 
     @model_validator(mode="after")
     def _validate_at_least_one_field(self):
         if all(
             v is None
-            for v in (self.name, self.user_metadata, self.mime_type, self.preview_id)
+            for v in (self.name, self.user_metadata, self.preview_id)
         ):
             raise ValueError(
-                "Provide at least one of: name, user_metadata, mime_type, preview_id."
+                "Provide at least one of: name, user_metadata, preview_id."
             )
         return self
 

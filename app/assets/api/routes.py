@@ -494,7 +494,6 @@ async def update_asset_route(request: web.Request) -> web.Response:
             name=body.name,
             user_metadata=body.user_metadata,
             owner_id=USER_MANAGER.get_request_user_id(request),
-            mime_type=body.mime_type,
             preview_id=body.preview_id,
         )
         payload = _build_asset_response(result)
