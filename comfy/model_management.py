@@ -55,6 +55,7 @@ total_vram = 0
 
 # Training Related State
 in_training = False
+training_fp8_bwd = False
 
 
 def get_supported_float8_types():
@@ -400,7 +401,7 @@ try:
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
             if aotriton_supported(arch):  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
-                    if any((a in arch) for a in ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1151"]):  # TODO: more arches, TODO: gfx950
+                    if any((a in arch) for a in ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1150", "gfx1151"]):  # TODO: more arches, TODO: gfx950
                         ENABLE_PYTORCH_ATTENTION = True
                 if rocm_version >= (7, 0):
                    if any((a in arch) for a in ["gfx1200", "gfx1201"]):
@@ -541,6 +542,7 @@ class LoadedModel:
         if model.parent is not None:
             self._parent_model = weakref.ref(model.parent)
             self._patcher_finalizer = weakref.finalize(model, self._switch_parent)
+            self._patcher_finalizer.atexit = False
 
     def _switch_parent(self):
         model = self._parent_model()
@@ -587,6 +589,7 @@ class LoadedModel:
 
         self.real_model = weakref.ref(real_model)
         self.model_finalizer = weakref.finalize(real_model, cleanup_models)
+        self.model_finalizer.atexit = False
         return real_model
 
     def should_reload_model(self, force_patch_weights=False):
@@ -1049,6 +1052,12 @@ def intermediate_device():
         return get_torch_device()
     else:
         return torch.device("cpu")
+
+def intermediate_dtype():
+    if args.fp16_intermediates:
+        return torch.float16
+    else:
+        return torch.float32
 
 def vae_device():
     if args.cpu_vae:
@@ -1704,6 +1713,19 @@ def supports_fp8_compute(device=None):
 
 def supports_nvfp4_compute(device=None):
     if not is_nvidia():
+        return False
+
+    props = torch.cuda.get_device_properties(device)
+    if props.major < 10:
+        return False
+
+    return True
+
+def supports_mxfp8_compute(device=None):
+    if not is_nvidia():
+        return False
+
+    if torch_version_numeric < (2, 10):
         return False
 
     props = torch.cuda.get_device_properties(device)
