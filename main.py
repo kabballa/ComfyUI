@@ -77,10 +77,22 @@ if __name__ == "__main__":
 
 setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
 
+def _redact_proxy_url(url):
+    """Redact userinfo from proxy URL to avoid leaking credentials in logs."""
+    from urllib.parse import urlparse, urlunparse
+    try:
+        parsed = urlparse(url)
+        if parsed.username:
+            netloc = f"***:***@{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
+            return urlunparse(parsed._replace(netloc=netloc))
+    except Exception:
+        pass
+    return url
+
 if os.environ.get('HTTP_PROXY'):
-    logging.info("HTTP proxy configured: %s", os.environ['HTTP_PROXY'])
+    logging.info("HTTP proxy configured: %s", _redact_proxy_url(os.environ['HTTP_PROXY']))
 if os.environ.get('HTTPS_PROXY'):
-    logging.info("HTTPS proxy configured: %s", os.environ['HTTPS_PROXY'])
+    logging.info("HTTPS proxy configured: %s", _redact_proxy_url(os.environ['HTTPS_PROXY']))
 
 faulthandler.enable(file=sys.stderr, all_threads=False)
 
