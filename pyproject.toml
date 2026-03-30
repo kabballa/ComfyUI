@@ -11,23 +11,14 @@ repository = "https://github.com/comfyanonymous/ComfyUI"
 documentation = "https://docs.comfy.org/"
 
 [tool.comfy.host]
-sandbox_mode = "required"
+sandbox_mode = "disabled"
 allow_network = false
 writable_paths = ["/dev/shm", "/tmp"]
 
 [tool.comfy.host.whitelist]
-"ComfyUI-Crystools" = "*"
-"ComfyUI-Florence2" = "*"
 "ComfyUI-GGUF" = "*"
 "ComfyUI-KJNodes" = "*"
-"ComfyUI-LTXVideo" = "*"
 "ComfyUI-Manager" = "*"
-"comfyui-depthanythingv2" = "*"
-"comfyui-kjnodes" = "*"
-"comfyui-videohelpersuite" = "*"
-"comfyui_controlnet_aux" = "*"
-"rgthree-comfy" = "*"
-"was-ns" = "*"
 "websocket_image_save.py" = "*"
 
 [tool.ruff]

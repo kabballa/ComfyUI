@@ -8,15 +8,84 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, TYPE_CHECKING
 
 from .proxies.helper_proxies import restore_input_types
-from comfy_api.internal import _ComfyNodeInternal
-from comfy_api.latest import _io as latest_io
 from .shm_forensics import scan_shm_forensics
+
+_IMPORT_TORCH = os.environ.get("PYISOLATE_IMPORT_TORCH", "1") == "1"
+
+_ComfyNodeInternal = object
+latest_io = None
+
+if _IMPORT_TORCH:
+    from comfy_api.internal import _ComfyNodeInternal
+    from comfy_api.latest import _io as latest_io
 
 if TYPE_CHECKING:
     from .extension_wrapper import ComfyNodeExtension
 
 LOG_PREFIX = "]["
 _PRE_EXEC_MIN_FREE_VRAM_BYTES = 2 * 1024 * 1024 * 1024
+
+
+class _RemoteObjectRegistryCaller:
+    def __init__(self, extension: Any) -> None:
+        self._extension = extension
+
+    def __getattr__(self, method_name: str) -> Any:
+        async def _call(instance_id: str, *args: Any, **kwargs: Any) -> Any:
+            return await self._extension.call_remote_object_method(
+                instance_id,
+                method_name,
+                *args,
+                **kwargs,
+            )
+
+        return _call
+
+
+def _wrap_remote_handles_as_host_proxies(value: Any, extension: Any) -> Any:
+    from pyisolate._internal.remote_handle import RemoteObjectHandle
+
+    if isinstance(value, RemoteObjectHandle):
+        if value.type_name == "ModelPatcher":
+            from comfy.isolation.model_patcher_proxy import ModelPatcherProxy
+
+            proxy = ModelPatcherProxy(value.object_id, manage_lifecycle=False)
+            proxy._rpc_caller = _RemoteObjectRegistryCaller(extension)  # type: ignore[attr-defined]
+            proxy._pyisolate_remote_handle = value  # type: ignore[attr-defined]
+            return proxy
+        if value.type_name == "VAE":
+            from comfy.isolation.vae_proxy import VAEProxy
+
+            proxy = VAEProxy(value.object_id, manage_lifecycle=False)
+            proxy._rpc_caller = _RemoteObjectRegistryCaller(extension)  # type: ignore[attr-defined]
+            proxy._pyisolate_remote_handle = value  # type: ignore[attr-defined]
+            return proxy
+        if value.type_name == "CLIP":
+            from comfy.isolation.clip_proxy import CLIPProxy
+
+            proxy = CLIPProxy(value.object_id, manage_lifecycle=False)
+            proxy._rpc_caller = _RemoteObjectRegistryCaller(extension)  # type: ignore[attr-defined]
+            proxy._pyisolate_remote_handle = value  # type: ignore[attr-defined]
+            return proxy
+        if value.type_name == "ModelSampling":
+            from comfy.isolation.model_sampling_proxy import ModelSamplingProxy
+
+            proxy = ModelSamplingProxy(value.object_id, manage_lifecycle=False)
+            proxy._rpc_caller = _RemoteObjectRegistryCaller(extension)  # type: ignore[attr-defined]
+            proxy._pyisolate_remote_handle = value  # type: ignore[attr-defined]
+            return proxy
+        return value
+
+    if isinstance(value, dict):
+        return {
+            k: _wrap_remote_handles_as_host_proxies(v, extension) for k, v in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        wrapped = [_wrap_remote_handles_as_host_proxies(item, extension) for item in value]
+        return type(value)(wrapped)
+
+    return value
 
 
 def _resource_snapshot() -> Dict[str, int]:
@@ -146,6 +215,8 @@ def build_stub_class(
     running_extensions: Dict[str, "ComfyNodeExtension"],
     logger: logging.Logger,
 ) -> type:
+    if latest_io is None:
+        raise RuntimeError("comfy_api.latest._io is required to build isolation stubs")
     is_v3 = bool(info.get("is_v3", False))
     function_name = "_pyisolate_execute"
     restored_input_types = restore_input_types(info.get("input_types", {}))
@@ -160,6 +231,13 @@ def build_stub_class(
         node_unique_id = _extract_hidden_unique_id(inputs)
         summary = _tensor_transport_summary(inputs)
         resources = _resource_snapshot()
+        logger.debug(
+            "%s ISO:execute_start ext=%s node=%s uid=%s",
+            LOG_PREFIX,
+            extension.name,
+            node_name,
+            node_unique_id or "-",
+        )
         logger.debug(
             "%s ISO:execute_start ext=%s node=%s uid=%s tensors=%d cpu=%d cuda=%d shared_cpu=%d bytes=%d fds=%d sender_shm=%d",
             LOG_PREFIX,
@@ -192,7 +270,20 @@ def build_stub_class(
                 node_name,
                 node_unique_id or "-",
             )
-            serialized = serialize_for_isolation(inputs)
+            # Unwrap NodeOutput-like dicts before serialization.
+            # OUTPUT_NODE nodes return {"ui": {...}, "result": (outputs...)}
+            # and the executor may pass this dict as input to downstream nodes.
+            unwrapped_inputs = {}
+            for k, v in inputs.items():
+                if isinstance(v, dict) and "result" in v and ("ui" in v or "__node_output__" in v):
+                    result = v.get("result")
+                    if isinstance(result, (tuple, list)) and len(result) > 0:
+                        unwrapped_inputs[k] = result[0]
+                    else:
+                        unwrapped_inputs[k] = result
+                else:
+                    unwrapped_inputs[k] = v
+            serialized = serialize_for_isolation(unwrapped_inputs)
             logger.debug(
                 "%s ISO:serialize_done ext=%s node=%s uid=%s",
                 LOG_PREFIX,
@@ -220,15 +311,32 @@ def build_stub_class(
                 from comfy_api.latest import io as latest_io
                 args_raw = result.get("args", ())
                 deserialized_args = await deserialize_from_isolation(args_raw, extension)
+                deserialized_args = _wrap_remote_handles_as_host_proxies(
+                    deserialized_args, extension
+                )
                 deserialized_args = _detach_shared_cpu_tensors(deserialized_args)
+                ui_raw = result.get("ui")
+                deserialized_ui = None
+                if ui_raw is not None:
+                    deserialized_ui = await deserialize_from_isolation(ui_raw, extension)
+                    deserialized_ui = _wrap_remote_handles_as_host_proxies(
+                        deserialized_ui, extension
+                    )
+                    deserialized_ui = _detach_shared_cpu_tensors(deserialized_ui)
                 scan_shm_forensics("RUNTIME:post_execute", refresh_model_context=True)
                 return latest_io.NodeOutput(
                     *deserialized_args,
-                    ui=result.get("ui"),
+                    ui=deserialized_ui,
                     expand=result.get("expand"),
                     block_execution=result.get("block_execution"),
                 )
+            # OUTPUT_NODE: if sealed worker returned a tuple/list whose first
+            # element is a {"ui": ...} dict, unwrap it for the executor.
+            if (isinstance(result, (tuple, list)) and len(result) == 1
+                    and isinstance(result[0], dict) and "ui" in result[0]):
+                return result[0]
             deserialized = await deserialize_from_isolation(result, extension)
+            deserialized = _wrap_remote_handles_as_host_proxies(deserialized, extension)
             scan_shm_forensics("RUNTIME:post_execute", refresh_model_context=True)
             return _detach_shared_cpu_tensors(deserialized)
         except ImportError:

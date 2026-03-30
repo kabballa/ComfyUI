@@ -118,6 +118,47 @@ def set_global_loop(loop: asyncio.AbstractEventLoop) -> None:
     _GLOBAL_LOOP = loop
 
 
+def run_sync_rpc_coro(coro: Any, timeout_ms: Optional[int] = None) -> Any:
+    if timeout_ms is not None:
+        coro = asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
+
+    try:
+        if _GLOBAL_LOOP is not None and _GLOBAL_LOOP.is_running():
+            try:
+                curr_loop = asyncio.get_running_loop()
+                if curr_loop is _GLOBAL_LOOP:
+                    pass
+            except RuntimeError:
+                future = asyncio.run_coroutine_threadsafe(coro, _GLOBAL_LOOP)
+                return future.result(
+                    timeout=(timeout_ms / 1000.0) if timeout_ms is not None else None
+                )
+
+        try:
+            asyncio.get_running_loop()
+            return run_coro_in_new_loop(coro)
+        except RuntimeError:
+            loop = get_thread_loop()
+            return loop.run_until_complete(coro)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"Isolation RPC timeout (timeout_ms={timeout_ms})") from exc
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(f"Isolation RPC timeout (timeout_ms={timeout_ms})") from exc
+
+
+def call_singleton_rpc(
+    caller: Any,
+    method_name: str,
+    *args: Any,
+    timeout_ms: Optional[int] = None,
+    **kwargs: Any,
+) -> Any:
+    if caller is None:
+        raise RuntimeError(f"No RPC caller available for {method_name}")
+    method = getattr(caller, method_name)
+    return run_sync_rpc_coro(method(*args, **kwargs), timeout_ms=timeout_ms)
+
+
 class BaseProxy(Generic[T]):
     _registry_class: type = BaseRegistry  # type: ignore[type-arg]
     __module__: str = "comfy.isolation.proxies.base"
@@ -208,31 +249,8 @@ class BaseProxy(Generic[T]):
         )
 
         try:
-            # If we have a global loop (Main Thread Loop), use it for dispatch from worker threads
-            if _GLOBAL_LOOP is not None and _GLOBAL_LOOP.is_running():
-                try:
-                    curr_loop = asyncio.get_running_loop()
-                    if curr_loop is _GLOBAL_LOOP:
-                        pass
-                except RuntimeError:
-                    # No running loop - we are in a worker thread.
-                    future = asyncio.run_coroutine_threadsafe(coro, _GLOBAL_LOOP)
-                    return future.result(
-                        timeout=(timeout_ms / 1000.0) if timeout_ms is not None else None
-                    )
-
-            try:
-                asyncio.get_running_loop()
-                return run_coro_in_new_loop(coro)
-            except RuntimeError:
-                loop = get_thread_loop()
-                return loop.run_until_complete(coro)
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"Isolation RPC timeout in {self.__class__.__name__}.{method_name} "
-                f"(instance_id={self._instance_id}, timeout_ms={timeout_ms})"
-            ) from exc
-        except concurrent.futures.TimeoutError as exc:
+            return run_sync_rpc_coro(coro, timeout_ms=timeout_ms)
+        except TimeoutError as exc:
             raise TimeoutError(
                 f"Isolation RPC timeout in {self.__class__.__name__}.{method_name} "
                 f"(instance_id={self._instance_id}, timeout_ms={timeout_ms})"

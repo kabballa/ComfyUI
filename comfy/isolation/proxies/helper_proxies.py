@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
+
+from pyisolate import ProxiedSingleton
+
+from .base import call_singleton_rpc
 
 
 class AnyTypeProxy(str):
@@ -71,9 +76,29 @@ def _restore_special_value(value: Any) -> Any:
     return value
 
 
-def restore_input_types(raw: Dict[str, object]) -> Dict[str, object]:
-    """Restore serialized INPUT_TYPES payload back into ComfyUI-compatible objects."""
+def _serialize_special_value(value: Any) -> Any:
+    if isinstance(value, AnyTypeProxy):
+        return {"__pyisolate_any_type__": True, "value": str(value)}
+    if isinstance(value, FlexibleOptionalInputProxy):
+        return {
+            "__pyisolate_flexible_optional__": True,
+            "type": _serialize_special_value(value.type),
+            "data": {k: _serialize_special_value(v) for k, v in value.items()},
+        }
+    if isinstance(value, ByPassTypeTupleProxy):
+        return {
+            "__pyisolate_bypass_tuple__": [_serialize_special_value(v) for v in value]
+        }
+    if isinstance(value, tuple):
+        return {"__pyisolate_tuple__": [_serialize_special_value(v) for v in value]}
+    if isinstance(value, list):
+        return [_serialize_special_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _serialize_special_value(v) for k, v in value.items()}
+    return value
 
+
+def _restore_input_types_local(raw: Dict[str, object]) -> Dict[str, object]:
     if not isinstance(raw, dict):
         return raw  # type: ignore[return-value]
 
@@ -90,9 +115,44 @@ def restore_input_types(raw: Dict[str, object]) -> Dict[str, object]:
     return restored
 
 
+class HelperProxiesService(ProxiedSingleton):
+    _rpc: Optional[Any] = None
+
+    @classmethod
+    def set_rpc(cls, rpc: Any) -> None:
+        cls._rpc = rpc.create_caller(cls, cls.get_remote_id())
+
+    @classmethod
+    def clear_rpc(cls) -> None:
+        cls._rpc = None
+
+    @classmethod
+    def _get_caller(cls) -> Any:
+        if cls._rpc is None:
+            raise RuntimeError("HelperProxiesService RPC caller is not configured")
+        return cls._rpc
+
+    async def rpc_restore_input_types(self, raw: Dict[str, object]) -> Dict[str, object]:
+        restored = _restore_input_types_local(raw)
+        return _serialize_special_value(restored)
+
+
+def restore_input_types(raw: Dict[str, object]) -> Dict[str, object]:
+    """Restore serialized INPUT_TYPES payload back into ComfyUI-compatible objects."""
+    if os.environ.get("PYISOLATE_CHILD") == "1":
+        payload = call_singleton_rpc(
+            HelperProxiesService._get_caller(),
+            "rpc_restore_input_types",
+            raw,
+        )
+        return _restore_input_types_local(payload)
+    return _restore_input_types_local(raw)
+
+
 __all__ = [
     "AnyTypeProxy",
     "FlexibleOptionalInputProxy",
     "ByPassTypeTupleProxy",
+    "HelperProxiesService",
     "restore_input_types",
 ]

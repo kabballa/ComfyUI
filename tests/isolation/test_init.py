@@ -1,5 +1,12 @@
 """Unit tests for PyIsolate isolation system initialization."""
 
+import importlib
+import sys
+
+from tests.isolation.singleton_boundary_helpers import (
+    FakeSingletonRPC,
+    reset_forbidden_singleton_modules,
+)
 
 
 def test_log_prefix():
@@ -11,9 +18,9 @@ def test_log_prefix():
 
 def test_module_initialization():
     """Verify module initializes without errors."""
-    import comfy.isolation
-    assert hasattr(comfy.isolation, 'LOG_PREFIX')
-    assert hasattr(comfy.isolation, 'initialize_proxies')
+    isolation_pkg = importlib.import_module("comfy.isolation")
+    assert hasattr(isolation_pkg, "LOG_PREFIX")
+    assert hasattr(isolation_pkg, "initialize_proxies")
 
 
 class TestInitializeProxies:
@@ -54,3 +61,20 @@ class TestInitializeProxies:
         utils_proxy = UtilsProxy()
         assert folder_proxy is not None
         assert utils_proxy is not None
+
+    def test_sealed_child_safe_initialize_proxies_avoids_real_utils_import(self, monkeypatch):
+        monkeypatch.setenv("PYISOLATE_CHILD", "1")
+        monkeypatch.setenv("PYISOLATE_IMPORT_TORCH", "0")
+        reset_forbidden_singleton_modules()
+
+        from pyisolate._internal import rpc_protocol
+        from comfy.isolation import initialize_proxies
+
+        fake_rpc = FakeSingletonRPC()
+        monkeypatch.setattr(rpc_protocol, "get_child_rpc_instance", lambda: fake_rpc)
+
+        initialize_proxies()
+
+        assert "comfy.utils" not in sys.modules
+        assert "folder_paths" not in sys.modules
+        assert "comfy_execution.progress" not in sys.modules

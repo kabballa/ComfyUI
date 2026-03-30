@@ -8,11 +8,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, TYPE_CHECKING
-import folder_paths
-from .extension_loader import load_isolated_node
-from .manifest_loader import find_manifest_directories
-from .runtime_helpers import build_stub_class, get_class_types_for_extension
-from .shm_forensics import scan_shm_forensics, start_shm_forensics
+_IMPORT_TORCH = os.environ.get("PYISOLATE_IMPORT_TORCH", "1") == "1"
+
+load_isolated_node = None
+find_manifest_directories = None
+build_stub_class = None
+get_class_types_for_extension = None
+scan_shm_forensics = None
+start_shm_forensics = None
+
+if _IMPORT_TORCH:
+    import folder_paths
+    from .extension_loader import load_isolated_node
+    from .manifest_loader import find_manifest_directories
+    from .runtime_helpers import build_stub_class, get_class_types_for_extension
+    from .shm_forensics import scan_shm_forensics, start_shm_forensics
 
 if TYPE_CHECKING:
     from pyisolate import ExtensionManager
@@ -21,8 +31,9 @@ if TYPE_CHECKING:
 LOG_PREFIX = "]["
 isolated_node_timings: List[tuple[float, Path, int]] = []
 
-PYISOLATE_VENV_ROOT = Path(folder_paths.base_path) / ".pyisolate_venvs"
-PYISOLATE_VENV_ROOT.mkdir(parents=True, exist_ok=True)
+if _IMPORT_TORCH:
+    PYISOLATE_VENV_ROOT = Path(folder_paths.base_path) / ".pyisolate_venvs"
+    PYISOLATE_VENV_ROOT.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 _WORKFLOW_BOUNDARY_MIN_FREE_VRAM_BYTES = 2 * 1024 * 1024 * 1024
@@ -42,7 +53,8 @@ def initialize_proxies() -> None:
         from .host_hooks import initialize_host_process
 
         initialize_host_process()
-        start_shm_forensics()
+        if start_shm_forensics is not None:
+            start_shm_forensics()
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,8 @@ async def initialize_isolation_nodes() -> List[IsolatedNodeSpec]:
         return []
 
     _ISOLATION_SCAN_ATTEMPTED = True
+    if find_manifest_directories is None or load_isolated_node is None or build_stub_class is None:
+        return []
     manifest_entries = find_manifest_directories()
     _CLAIMED_PATHS = {entry[0].resolve() for entry in manifest_entries}
 
@@ -167,17 +181,27 @@ def _get_class_types_for_extension(extension_name: str) -> Set[str]:
     return class_types
 
 
-async def notify_execution_graph(needed_class_types: Set[str]) -> None:
-    """Evict running extensions not needed for current execution."""
+async def notify_execution_graph(needed_class_types: Set[str], caches: list | None = None) -> None:
+    """Evict running extensions not needed for current execution.
+
+    When *caches* is provided, cache entries for evicted extensions' node
+    class_types are invalidated to prevent stale ``RemoteObjectHandle``
+    references from surviving in the output cache.
+    """
     await wait_for_model_patcher_quiescence(
         timeout_ms=_MODEL_PATCHER_IDLE_TIMEOUT_MS,
         fail_loud=True,
         marker="ISO:notify_graph_wait_idle",
     )
 
+    evicted_class_types: Set[str] = set()
+
     async def _stop_extension(
         ext_name: str, extension: "ComfyNodeExtension", reason: str
     ) -> None:
+        # Collect class_types BEFORE stopping so we can invalidate cache entries.
+        ext_class_types = _get_class_types_for_extension(ext_name)
+        evicted_class_types.update(ext_class_types)
         logger.info("%s ISO:eject_start ext=%s reason=%s", LOG_PREFIX, ext_name, reason)
         logger.debug("%s ISO:stop_start ext=%s", LOG_PREFIX, ext_name)
         stop_result = extension.stop()
@@ -185,9 +209,11 @@ async def notify_execution_graph(needed_class_types: Set[str]) -> None:
             await stop_result
         _RUNNING_EXTENSIONS.pop(ext_name, None)
         logger.debug("%s ISO:stop_done ext=%s", LOG_PREFIX, ext_name)
-        scan_shm_forensics("ISO:stop_extension", refresh_model_context=True)
+        if scan_shm_forensics is not None:
+            scan_shm_forensics("ISO:stop_extension", refresh_model_context=True)
 
-    scan_shm_forensics("ISO:notify_graph_start", refresh_model_context=True)
+    if scan_shm_forensics is not None:
+        scan_shm_forensics("ISO:notify_graph_start", refresh_model_context=True)
     isolated_class_types_in_graph = needed_class_types.intersection(
         {spec.node_name for spec in _ISOLATED_NODE_SPECS}
     )
@@ -247,6 +273,22 @@ async def notify_execution_graph(needed_class_types: Set[str]) -> None:
             "%s workflow-boundary host VRAM relief failed", LOG_PREFIX, exc_info=True
         )
     finally:
+        # Invalidate cached outputs for evicted extensions so stale
+        # RemoteObjectHandle references are not served from cache.
+        if evicted_class_types and caches:
+            total_invalidated = 0
+            for cache in caches:
+                if hasattr(cache, "invalidate_by_class_types"):
+                    total_invalidated += cache.invalidate_by_class_types(
+                        evicted_class_types
+                    )
+            if total_invalidated > 0:
+                logger.info(
+                    "%s ISO:cache_invalidated count=%d class_types=%s",
+                    LOG_PREFIX,
+                    total_invalidated,
+                    evicted_class_types,
+                )
         scan_shm_forensics("ISO:notify_graph_done", refresh_model_context=True)
         logger.debug(
             "%s ISO:notify_graph_done running=%d", LOG_PREFIX, len(_RUNNING_EXTENSIONS)

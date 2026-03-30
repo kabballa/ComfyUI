@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 from typing import Optional, Any
-import comfy.utils
 from pyisolate import ProxiedSingleton
 
 import os
+
+
+def _comfy_utils():
+    import comfy.utils
+    return comfy.utils
 
 
 class UtilsProxy(ProxiedSingleton):
@@ -23,6 +27,10 @@ class UtilsProxy(ProxiedSingleton):
         # Create caller using class name as ID (standard for Singletons)
         cls._rpc = rpc.create_caller(cls, "UtilsProxy")
 
+    @classmethod
+    def clear_rpc(cls) -> None:
+        cls._rpc = None
+
     async def progress_bar_hook(
         self,
         value: int,
@@ -35,30 +43,22 @@ class UtilsProxy(ProxiedSingleton):
         Child-side: this method call is intercepted by RPC and sent to host.
         """
         if os.environ.get("PYISOLATE_CHILD") == "1":
-            # Manual RPC dispatch for Child process
-            # Use class-level RPC storage (Static Injection)
-            if UtilsProxy._rpc:
-                return await UtilsProxy._rpc.progress_bar_hook(
-                    value, total, preview, node_id
-                )
-
-            # Fallback channel: global child rpc
-            try:
-                from pyisolate._internal.rpc_protocol import get_child_rpc_instance
-
-                get_child_rpc_instance()
-                # If we have an RPC instance but no UtilsProxy._rpc, we *could* try to use it,
-                # but we need a caller. For now, just pass to avoid crashing.
-                pass
-            except (ImportError, LookupError):
-                pass
-
-            return None
+            if UtilsProxy._rpc is None:
+                raise RuntimeError("UtilsProxy RPC caller is not configured")
+            return await UtilsProxy._rpc.progress_bar_hook(
+                value, total, preview, node_id
+            )
 
         # Host Execution
-        if comfy.utils.PROGRESS_BAR_HOOK is not None:
-            comfy.utils.PROGRESS_BAR_HOOK(value, total, preview, node_id)
+        utils = _comfy_utils()
+        if utils.PROGRESS_BAR_HOOK is not None:
+            return utils.PROGRESS_BAR_HOOK(value, total, preview, node_id)
+        return None
 
     def set_progress_bar_global_hook(self, hook: Any) -> None:
         """Forward hook registration (though usually not needed from child)."""
-        comfy.utils.set_progress_bar_global_hook(hook)
+        if os.environ.get("PYISOLATE_CHILD") == "1":
+            raise RuntimeError(
+                "UtilsProxy.set_progress_bar_global_hook is not available in child without exact relay support"
+            )
+        _comfy_utils().set_progress_bar_global_hook(hook)

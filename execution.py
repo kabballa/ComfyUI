@@ -685,7 +685,7 @@ class PromptExecutor:
             return
         try:
             from comfy.isolation import notify_execution_graph
-            await notify_execution_graph(class_types)
+            await notify_execution_graph(class_types, caches=self.caches.all)
         except Exception:
             if fail_loud:
                 raise
@@ -785,26 +785,26 @@ class PromptExecutor:
         self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
 
-        with torch.inference_mode():
-            if args.use_process_isolation:
-                try:
-                    # Boundary cleanup runs at the start of the next workflow in
-                    # isolation mode, matching non-isolated "next prompt" timing.
-                    self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)
-                    await self._wait_model_patcher_quiescence_safe(
-                        fail_loud=False,
-                        timeout_ms=120000,
-                        marker="EX:boundary_cleanup_wait_idle",
-                    )
-                    await self._flush_running_extensions_transport_state_safe()
-                    comfy.model_management.unload_all_models()
-                    comfy.model_management.cleanup_models_gc()
-                    comfy.model_management.cleanup_models()
-                    gc.collect()
-                    comfy.model_management.soft_empty_cache()
-                except Exception:
-                    logging.debug("][ EX:isolation_boundary_cleanup_start failed", exc_info=True)
+        if args.use_process_isolation:
+            try:
+                # Boundary cleanup runs at the start of the next workflow in
+                # isolation mode, matching non-isolated "next prompt" timing.
+                self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)
+                await self._wait_model_patcher_quiescence_safe(
+                    fail_loud=False,
+                    timeout_ms=120000,
+                    marker="EX:boundary_cleanup_wait_idle",
+                )
+                await self._flush_running_extensions_transport_state_safe()
+                comfy.model_management.unload_all_models()
+                comfy.model_management.cleanup_models_gc()
+                comfy.model_management.cleanup_models()
+                gc.collect()
+                comfy.model_management.soft_empty_cache()
+            except Exception:
+                logging.debug("][ EX:isolation_boundary_cleanup_start failed", exc_info=True)
 
+        with torch.inference_mode():
             dynamic_prompt = DynamicPrompt(prompt)
             reset_progress_state(prompt_id, dynamic_prompt)
             add_progress_handler(WebUIProgressHandler(self.server))

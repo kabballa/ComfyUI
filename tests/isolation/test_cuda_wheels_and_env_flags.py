@@ -8,13 +8,19 @@ import logging
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
+import comfy.isolation as isolation_pkg
 from comfy.isolation import runtime_helpers
+from comfy.isolation import extension_loader as extension_loader_module
+from comfy.isolation import extension_wrapper as extension_wrapper_module
+from comfy.isolation import model_patcher_proxy_utils
 from comfy.isolation.extension_loader import ExtensionLoadError, load_isolated_node
 from comfy.isolation.extension_wrapper import ComfyNodeExtension
 from comfy.isolation.model_patcher_proxy_utils import maybe_wrap_model_for_isolation
+from pyisolate._internal.environment_conda import _generate_pixi_toml
 
 
 class _DummyExtension:
@@ -63,11 +69,10 @@ flash_attn = "flash-attn-special"
             captured.update(config)
             return _DummyExtension()
 
+    monkeypatch.setattr(extension_loader_module.pyisolate, "ExtensionManager", DummyManager)
     monkeypatch.setattr(
-        "comfy.isolation.extension_loader.pyisolate.ExtensionManager", DummyManager
-    )
-    monkeypatch.setattr(
-        "comfy.isolation.extension_loader.load_host_policy",
+        extension_loader_module,
+        "load_host_policy",
         lambda base_path: {
             "sandbox_mode": "required",
             "allow_network": False,
@@ -75,11 +80,10 @@ flash_attn = "flash-attn-special"
             "readonly_paths": [],
         },
     )
+    monkeypatch.setattr(extension_loader_module, "is_cache_valid", lambda *args, **kwargs: True)
     monkeypatch.setattr(
-        "comfy.isolation.extension_loader.is_cache_valid", lambda *args, **kwargs: True
-    )
-    monkeypatch.setattr(
-        "comfy.isolation.extension_loader.load_from_cache",
+        extension_loader_module,
+        "load_from_cache",
         lambda *args, **kwargs: {"Node": {"display_name": "Node", "schema_v1": {}}},
     )
     monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(base_path=str(tmp_path)))
@@ -141,6 +145,163 @@ packages = ["flash-attn"]
         )
 
 
+def test_conda_cuda_wheels_declared_packages_do_not_force_pixi_solve(tmp_path, monkeypatch):
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    manifest_path = node_dir / "pyproject.toml"
+    _write_manifest(
+        node_dir,
+        """
+[project]
+name = "demo-node"
+dependencies = ["numpy>=1.0", "spconv", "cumm", "flash-attn"]
+
+[tool.comfy.isolation]
+can_isolate = true
+package_manager = "conda"
+conda_channels = ["conda-forge"]
+
+[tool.comfy.isolation.cuda_wheels]
+index_url = "https://example.invalid/cuda-wheels"
+packages = ["spconv", "cumm", "flash-attn"]
+""".strip(),
+    )
+
+    captured: dict[str, object] = {}
+
+    class DummyManager:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def load_extension(self, config):
+            captured.update(config)
+            return _DummyExtension()
+
+    monkeypatch.setattr(extension_loader_module.pyisolate, "ExtensionManager", DummyManager)
+    monkeypatch.setattr(
+        extension_loader_module,
+        "load_host_policy",
+        lambda base_path: {
+            "sandbox_mode": "disabled",
+            "allow_network": False,
+            "writable_paths": [],
+            "readonly_paths": [],
+        },
+    )
+    monkeypatch.setattr(extension_loader_module, "is_cache_valid", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        extension_loader_module,
+        "load_from_cache",
+        lambda *args, **kwargs: {"Node": {"display_name": "Node", "schema_v1": {}}},
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(base_path=str(tmp_path)))
+
+    asyncio.run(
+        load_isolated_node(
+            node_dir,
+            manifest_path,
+            logging.getLogger("test"),
+            lambda *args, **kwargs: object,
+            tmp_path / "venvs",
+            [],
+        )
+    )
+
+    generated = _generate_pixi_toml(captured)
+    assert 'numpy = ">=1.0"' in generated
+    assert "spconv =" not in generated
+    assert "cumm =" not in generated
+    assert "flash-attn =" not in generated
+
+
+def test_conda_cuda_wheels_loader_accepts_sam3d_contract(tmp_path, monkeypatch):
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    manifest_path = node_dir / "pyproject.toml"
+    _write_manifest(
+        node_dir,
+        """
+[project]
+name = "demo-node"
+dependencies = [
+  "torch",
+  "torchvision",
+  "pytorch3d",
+  "gsplat",
+  "nvdiffrast",
+  "flash-attn",
+  "sageattention",
+  "spconv",
+  "cumm",
+]
+
+[tool.comfy.isolation]
+can_isolate = true
+package_manager = "conda"
+conda_channels = ["conda-forge"]
+
+[tool.comfy.isolation.cuda_wheels]
+index_url = "https://example.invalid/cuda-wheels"
+packages = ["pytorch3d", "gsplat", "nvdiffrast", "flash-attn", "sageattention", "spconv", "cumm"]
+""".strip(),
+    )
+
+    captured: dict[str, object] = {}
+
+    class DummyManager:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def load_extension(self, config):
+            captured.update(config)
+            return _DummyExtension()
+
+    monkeypatch.setattr(extension_loader_module.pyisolate, "ExtensionManager", DummyManager)
+    monkeypatch.setattr(
+        extension_loader_module,
+        "load_host_policy",
+        lambda base_path: {
+            "sandbox_mode": "disabled",
+            "allow_network": False,
+            "writable_paths": [],
+            "readonly_paths": [],
+        },
+    )
+    monkeypatch.setattr(extension_loader_module, "is_cache_valid", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        extension_loader_module,
+        "load_from_cache",
+        lambda *args, **kwargs: {"Node": {"display_name": "Node", "schema_v1": {}}},
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(base_path=str(tmp_path)))
+
+    asyncio.run(
+        load_isolated_node(
+            node_dir,
+            manifest_path,
+            logging.getLogger("test"),
+            lambda *args, **kwargs: object,
+            tmp_path / "venvs",
+            [],
+        )
+    )
+
+    assert captured["package_manager"] == "conda"
+    assert captured["cuda_wheels"] == {
+        "index_url": "https://example.invalid/cuda-wheels/",
+        "packages": [
+            "pytorch3d",
+            "gsplat",
+            "nvdiffrast",
+            "flash-attn",
+            "sageattention",
+            "spconv",
+            "cumm",
+        ],
+        "package_map": {},
+    }
+
+
 def test_load_isolated_node_omits_cuda_wheels_when_not_configured(tmp_path, monkeypatch):
     node_dir = tmp_path / "node"
     node_dir.mkdir()
@@ -167,11 +328,10 @@ can_isolate = true
             captured.update(config)
             return _DummyExtension()
 
+    monkeypatch.setattr(extension_loader_module.pyisolate, "ExtensionManager", DummyManager)
     monkeypatch.setattr(
-        "comfy.isolation.extension_loader.pyisolate.ExtensionManager", DummyManager
-    )
-    monkeypatch.setattr(
-        "comfy.isolation.extension_loader.load_host_policy",
+        extension_loader_module,
+        "load_host_policy",
         lambda base_path: {
             "sandbox_mode": "disabled",
             "allow_network": False,
@@ -179,11 +339,10 @@ can_isolate = true
             "readonly_paths": [],
         },
     )
+    monkeypatch.setattr(extension_loader_module, "is_cache_valid", lambda *args, **kwargs: True)
     monkeypatch.setattr(
-        "comfy.isolation.extension_loader.is_cache_valid", lambda *args, **kwargs: True
-    )
-    monkeypatch.setattr(
-        "comfy.isolation.extension_loader.load_from_cache",
+        extension_loader_module,
+        "load_from_cache",
         lambda *args, **kwargs: {"Node": {"display_name": "Node", "schema_v1": {}}},
     )
     monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(base_path=str(tmp_path)))
@@ -214,7 +373,7 @@ def test_maybe_wrap_model_for_isolation_uses_runtime_flag(monkeypatch):
             self.registry = registry
             self.manage_lifecycle = manage_lifecycle
 
-    monkeypatch.setattr("comfy.isolation.model_patcher_proxy_utils.args.use_process_isolation", True)
+    monkeypatch.setattr(model_patcher_proxy_utils.args, "use_process_isolation", True)
     monkeypatch.delenv("PYISOLATE_ISOLATION_ACTIVE", raising=False)
     monkeypatch.delenv("PYISOLATE_CHILD", raising=False)
     monkeypatch.setitem(
@@ -228,20 +387,17 @@ def test_maybe_wrap_model_for_isolation_uses_runtime_flag(monkeypatch):
         SimpleNamespace(ModelPatcherProxy=DummyProxy),
     )
 
-    wrapped = maybe_wrap_model_for_isolation(object())
+    wrapped = cast(Any, maybe_wrap_model_for_isolation(object()))
 
     assert isinstance(wrapped, DummyProxy)
-    assert wrapped.model_id == "model-123"
-    assert wrapped.manage_lifecycle is True
+    assert getattr(wrapped, "model_id") == "model-123"
+    assert getattr(wrapped, "manage_lifecycle") is True
 
 
 def test_flush_transport_state_uses_child_env_without_legacy_flag(monkeypatch):
     monkeypatch.setenv("PYISOLATE_CHILD", "1")
     monkeypatch.delenv("PYISOLATE_ISOLATION_ACTIVE", raising=False)
-    monkeypatch.setattr(
-        "comfy.isolation.extension_wrapper._flush_tensor_transport_state",
-        lambda marker: 3,
-    )
+    monkeypatch.setattr(extension_wrapper_module, "_flush_tensor_transport_state", lambda marker: 3)
     monkeypatch.setitem(
         sys.modules,
         "comfy.isolation.model_patcher_proxy_registry",
@@ -260,8 +416,6 @@ def test_flush_transport_state_uses_child_env_without_legacy_flag(monkeypatch):
 
 
 def test_build_stub_class_relieves_host_vram_without_legacy_flag(monkeypatch):
-    import comfy.isolation as isolation_pkg
-
     relieve_calls: list[str] = []
 
     async def deserialize_from_isolation(result, extension):
