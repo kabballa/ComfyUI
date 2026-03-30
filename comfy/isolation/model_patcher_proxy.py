@@ -22,6 +22,16 @@ class ModelPatcherProxy(BaseProxy[ModelPatcherRegistry]):
     __module__ = "comfy.model_patcher"
     _APPLY_MODEL_GUARD_PADDING_BYTES = 32 * 1024 * 1024
 
+    def _spawn_related_proxy(self, instance_id: str) -> "ModelPatcherProxy":
+        proxy = ModelPatcherProxy(
+            instance_id,
+            self._registry,
+            manage_lifecycle=not IS_CHILD_PROCESS,
+        )
+        if getattr(self, "_rpc_caller", None) is not None:
+            proxy._rpc_caller = self._rpc_caller
+        return proxy
+
     def _get_rpc(self) -> Any:
         if self._rpc_caller is None:
             from pyisolate._internal.rpc_protocol import get_child_rpc_instance
@@ -164,9 +174,7 @@ class ModelPatcherProxy(BaseProxy[ModelPatcherRegistry]):
 
     def clone(self) -> ModelPatcherProxy:
         new_id = self._call_rpc("clone")
-        return ModelPatcherProxy(
-            new_id, self._registry, manage_lifecycle=not IS_CHILD_PROCESS
-        )
+        return self._spawn_related_proxy(new_id)
 
     def clone_has_same_weights(self, clone: Any) -> bool:
         if isinstance(clone, ModelPatcherProxy):
@@ -509,11 +517,7 @@ class ModelPatcherProxy(BaseProxy[ModelPatcherRegistry]):
         )
         new_model = None
         if result.get("model_id"):
-            new_model = ModelPatcherProxy(
-                result["model_id"],
-                self._registry,
-                manage_lifecycle=not IS_CHILD_PROCESS,
-            )
+            new_model = self._spawn_related_proxy(result["model_id"])
         new_clip = None
         if result.get("clip_id"):
             from comfy.isolation.clip_proxy import CLIPProxy
@@ -789,12 +793,7 @@ class ModelPatcherProxy(BaseProxy[ModelPatcherRegistry]):
 
     def get_additional_models(self) -> List[ModelPatcherProxy]:
         ids = self._call_rpc("get_additional_models")
-        return [
-            ModelPatcherProxy(
-                mid, self._registry, manage_lifecycle=not IS_CHILD_PROCESS
-            )
-            for mid in ids
-        ]
+        return [self._spawn_related_proxy(mid) for mid in ids]
 
     def model_patches_models(self) -> Any:
         return self._call_rpc("model_patches_models")
@@ -802,6 +801,25 @@ class ModelPatcherProxy(BaseProxy[ModelPatcherRegistry]):
     @property
     def parent(self) -> Any:
         return self._call_rpc("get_parent")
+
+    def model_mmap_residency(self, free: bool = False) -> tuple:
+        result = self._call_rpc("model_mmap_residency", free)
+        if isinstance(result, list):
+            return tuple(result)
+        return result
+
+    def pinned_memory_size(self) -> int:
+        return self._call_rpc("pinned_memory_size")
+
+    def get_non_dynamic_delegate(self) -> ModelPatcherProxy:
+        new_id = self._call_rpc("get_non_dynamic_delegate")
+        return self._spawn_related_proxy(new_id)
+
+    def disable_model_cfg1_optimization(self) -> None:
+        self._call_rpc("disable_model_cfg1_optimization")
+
+    def set_model_noise_refiner_patch(self, patch: Any) -> None:
+        self.set_model_patch(patch, "noise_refiner")
 
 
 class _InnerModelProxy:
@@ -812,8 +830,14 @@ class _InnerModelProxy:
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
+        if name == "model_config":
+            from types import SimpleNamespace
+
+            data = self._parent._call_rpc("get_inner_model_attr", name)
+            if isinstance(data, dict):
+                return SimpleNamespace(**data)
+            return data
         if name in (
-            "model_config",
             "latent_format",
             "model_type",
             "current_weight_patches_uuid",
@@ -824,11 +848,14 @@ class _InnerModelProxy:
         if name == "device":
             return self._parent._call_rpc("get_inner_model_attr", "device")
         if name == "current_patcher":
-            return ModelPatcherProxy(
+            proxy = ModelPatcherProxy(
                 self._parent._instance_id,
                 self._parent._registry,
                 manage_lifecycle=False,
             )
+            if getattr(self._parent, "_rpc_caller", None) is not None:
+                proxy._rpc_caller = self._parent._rpc_caller
+            return proxy
         if name == "model_sampling":
             if self._model_sampling is None:
                 self._model_sampling = self._parent._call_rpc(

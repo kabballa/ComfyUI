@@ -250,21 +250,46 @@ class ModelPatcherRegistry(BaseRegistry[Any]):
             return f"<ModelObject: {type(instance.model).__name__}>"
         result = instance.get_model_object(name)
         if name == "model_sampling":
-            from comfy.isolation.model_sampling_proxy import (
-                ModelSamplingRegistry,
-                ModelSamplingProxy,
-            )
-
-            registry = ModelSamplingRegistry()
-            # Preserve identity when upstream already returned a proxy. Re-registering
-            # a proxy object creates proxy-of-proxy call chains.
-            if isinstance(result, ModelSamplingProxy):
-                sampling_id = result._instance_id
-            else:
-                sampling_id = registry.register(result)
-            return ModelSamplingProxy(sampling_id, registry)
+            # Return inline serialization so the child reconstructs the real
+            # class with correct isinstance behavior. Returning a
+            # ModelSamplingProxy breaks isinstance checks (e.g.
+            # offset_first_sigma_for_snr in k_diffusion/sampling.py:173).
+            return self._serialize_model_sampling_inline(result)
 
         return detach_if_grad(result)
+
+    @staticmethod
+    def _serialize_model_sampling_inline(obj: Any) -> dict:
+        """Serialize a ModelSampling object as inline data for the child to reconstruct."""
+        import torch
+        import base64
+        import io as _io
+
+        bases = []
+        for base in type(obj).__mro__:
+            if base.__module__ == "comfy.model_sampling" and base.__name__ != "object":
+                bases.append(base.__name__)
+
+        sd = obj.state_dict()
+        sd_serialized = {}
+        for k, v in sd.items():
+            buf = _io.BytesIO()
+            torch.save(v, buf)
+            sd_serialized[k] = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        plain_attrs = {}
+        for k, v in obj.__dict__.items():
+            if k.startswith("_"):
+                continue
+            if isinstance(v, (bool, int, float, str)):
+                plain_attrs[k] = v
+
+        return {
+            "__type__": "ModelSamplingInline",
+            "bases": bases,
+            "state_dict": sd_serialized,
+            "attrs": plain_attrs,
+        }
 
     async def get_model_options(self, instance_id: str) -> dict:
         instance = self._get_instance(instance_id)
@@ -347,6 +372,20 @@ class ModelPatcherRegistry(BaseRegistry[Any]):
 
     async def get_ram_usage(self, instance_id: str) -> int:
         return self._get_instance(instance_id).get_ram_usage()
+
+    async def model_mmap_residency(self, instance_id: str, free: bool = False) -> tuple:
+        return self._get_instance(instance_id).model_mmap_residency(free=free)
+
+    async def pinned_memory_size(self, instance_id: str) -> int:
+        return self._get_instance(instance_id).pinned_memory_size()
+
+    async def get_non_dynamic_delegate(self, instance_id: str) -> str:
+        instance = self._get_instance(instance_id)
+        delegate = instance.get_non_dynamic_delegate()
+        return self.register(delegate)
+
+    async def disable_model_cfg1_optimization(self, instance_id: str) -> None:
+        self._get_instance(instance_id).disable_model_cfg1_optimization()
 
     async def lowvram_patch_counter(self, instance_id: str) -> int:
         return self._get_instance(instance_id).lowvram_patch_counter()
@@ -959,11 +998,53 @@ class ModelPatcherRegistry(BaseRegistry[Any]):
 
     async def get_inner_model_attr(self, instance_id: str, name: str) -> Any:
         try:
-            return self._sanitize_rpc_result(
-                getattr(self._get_instance(instance_id).model, name)
-            )
+            value = getattr(self._get_instance(instance_id).model, name)
+            if name == "model_config":
+                value = self._extract_model_config(value)
+            return self._sanitize_rpc_result(value)
         except AttributeError:
             return None
+
+    @staticmethod
+    def _extract_model_config(config: Any) -> dict:
+        """Extract JSON-safe attributes from a model config object.
+
+        ComfyUI model config classes (supported_models_base.BASE subclasses)
+        have a permissive __getattr__ that returns None for any unknown
+        attribute instead of raising AttributeError. This defeats hasattr-based
+        duck-typing in _sanitize_rpc_result, causing TypeError when it tries
+        to call obj.items() (which resolves to None). We extract the real
+        class-level and instance-level attributes into a plain dict.
+        """
+        # Attributes consumed by ModelSampling*.__init__ and other callers
+        _CONFIG_KEYS = (
+            "sampling_settings",
+            "unet_config",
+            "unet_extra_config",
+            "latent_format",
+            "manual_cast_dtype",
+            "custom_operations",
+            "optimizations",
+            "memory_usage_factor",
+            "supported_inference_dtypes",
+        )
+        result: dict = {}
+        for key in _CONFIG_KEYS:
+            # Use type(config).__dict__ first (class attrs), then instance __dict__
+            # to avoid triggering the permissive __getattr__
+            if key in type(config).__dict__:
+                val = type(config).__dict__[key]
+                # Skip classmethods/staticmethods/descriptors
+                if not callable(val) or isinstance(val, (dict, list, tuple)):
+                    result[key] = val
+            elif hasattr(config, "__dict__") and key in config.__dict__:
+                result[key] = config.__dict__[key]
+        # Also include instance overrides (e.g. set_inference_dtype sets unet_config['dtype'])
+        if hasattr(config, "__dict__"):
+            for key, val in config.__dict__.items():
+                if key in _CONFIG_KEYS:
+                    result[key] = val
+        return result
 
     async def inner_model_memory_required(
         self, instance_id: str, args: tuple, kwargs: dict
