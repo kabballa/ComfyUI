@@ -42,6 +42,7 @@ from comfy_execution.progress import get_progress_state, reset_progress_state, a
 from comfy_execution.utils import CurrentNodeContext
 from comfy_api.internal import _ComfyNodeInternal, _NodeOutputInternal, first_real_override, is_class, make_locked_method_func
 from comfy_api.latest import io, _io
+from comfy_execution.cache_provider import _has_cache_providers, _get_cache_providers, _logger as _cache_logger
 
 _AIMDO_VBAR_RESET_UNAVAILABLE_LOGGED = False
 
@@ -130,15 +131,15 @@ class CacheSet:
 
     # Performs like the old cache -- dump data ASAP
     def init_classic_cache(self):
-        self.outputs = HierarchicalCache(CacheKeySetInputSignature)
+        self.outputs = HierarchicalCache(CacheKeySetInputSignature, enable_providers=True)
         self.objects = HierarchicalCache(CacheKeySetID)
 
     def init_lru_cache(self, cache_size):
-        self.outputs = LRUCache(CacheKeySetInputSignature, max_size=cache_size)
+        self.outputs = LRUCache(CacheKeySetInputSignature, max_size=cache_size, enable_providers=True)
         self.objects = HierarchicalCache(CacheKeySetID)
 
     def init_ram_cache(self, min_headroom):
-        self.outputs = RAMPressureCache(CacheKeySetInputSignature)
+        self.outputs = RAMPressureCache(CacheKeySetInputSignature, enable_providers=True)
         self.objects = HierarchicalCache(CacheKeySetID)
 
     def init_null_cache(self):
@@ -433,7 +434,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     inputs = dynprompt.get_node(unique_id)['inputs']
     class_type = dynprompt.get_node(unique_id)['class_type']
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-    cached = caches.outputs.get(unique_id)
+    cached = await caches.outputs.get(unique_id)
     if cached is not None:
         if server.client_id is not None:
             cached_ui = cached.ui or {}
@@ -489,10 +490,10 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 server.last_node_id = display_node_id
                 server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, server.client_id)
 
-            obj = caches.objects.get(unique_id)
+            obj = await caches.objects.get(unique_id)
             if obj is None:
                 obj = class_def()
-                caches.objects.set(unique_id, obj)
+                await caches.objects.set(unique_id, obj)
 
             if issubclass(class_def, _ComfyNodeInternal):
                 lazy_status_present = first_real_override(class_def, "check_lazy_status") is not None
@@ -536,7 +537,15 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 GraphBuilder.set_default_prefix(unique_id, call_index, 0)
 
             try:
-                output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
+                output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(
+                    prompt_id,
+                    unique_id,
+                    obj,
+                    input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb,
+                    v3_data=v3_data,
+                )
             finally:
                 if comfy.memory_management.aimdo_enabled:
                     if args.verbose == "DEBUG":
@@ -621,7 +630,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
 
         cache_entry = CacheEntry(ui=ui_outputs.get(unique_id), outputs=output_data)
         execution_list.cache_update(unique_id, cache_entry)
-        caches.outputs.set(unique_id, cache_entry)
+        await caches.outputs.set(unique_id, cache_entry)
 
     except comfy.model_management.InterruptProcessingException as iex:
         logging.info("Processing interrupted")
@@ -685,7 +694,7 @@ class PromptExecutor:
             return
         try:
             from comfy.isolation import notify_execution_graph
-            await notify_execution_graph(class_types)
+            await notify_execution_graph(class_types, caches=self.caches.all)
         except Exception:
             if fail_loud:
                 raise
@@ -757,6 +766,19 @@ class PromptExecutor:
             }
             self.add_message("execution_error", mes, broadcast=False)
 
+    def _notify_prompt_lifecycle(self, event: str, prompt_id: str):
+        if not _has_cache_providers():
+            return
+
+        for provider in _get_cache_providers():
+            try:
+                if event == "start":
+                    provider.on_prompt_start(prompt_id)
+                elif event == "end":
+                    provider.on_prompt_end(prompt_id)
+            except Exception as e:
+                _cache_logger.warning(f"Cache provider {provider.__class__.__name__} error on {event}: {e}")
+
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
         asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
 
@@ -785,98 +807,106 @@ class PromptExecutor:
         self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
 
-        with torch.inference_mode():
-            if args.use_process_isolation:
-                try:
-                    # Boundary cleanup runs at the start of the next workflow in
-                    # isolation mode, matching non-isolated "next prompt" timing.
-                    self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)
-                    await self._wait_model_patcher_quiescence_safe(
-                        fail_loud=False,
-                        timeout_ms=120000,
-                        marker="EX:boundary_cleanup_wait_idle",
-                    )
-                    await self._flush_running_extensions_transport_state_safe()
-                    comfy.model_management.unload_all_models()
-                    comfy.model_management.cleanup_models_gc()
-                    comfy.model_management.cleanup_models()
-                    gc.collect()
-                    comfy.model_management.soft_empty_cache()
-                except Exception:
-                    logging.debug("][ EX:isolation_boundary_cleanup_start failed", exc_info=True)
-
-            dynamic_prompt = DynamicPrompt(prompt)
-            reset_progress_state(prompt_id, dynamic_prompt)
-            add_progress_handler(WebUIProgressHandler(self.server))
-            is_changed_cache = IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)
-            for cache in self.caches.all:
-                await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
-                cache.clean_unused()
-
-            cached_nodes = []
-            for node_id in prompt:
-                if self.caches.outputs.get(node_id) is not None:
-                    cached_nodes.append(node_id)
-
-            comfy.model_management.cleanup_models_gc()
-            self.add_message("execution_cached",
-                          { "nodes": cached_nodes, "prompt_id": prompt_id},
-                          broadcast=False)
-            pending_subgraph_results = {}
-            pending_async_nodes = {} # TODO - Unify this with pending_subgraph_results
-            ui_node_outputs = {}
-            executed = set()
-            execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
-            current_outputs = self.caches.outputs.all_node_ids()
-            for node_id in list(execute_outputs):
-                execution_list.add_node(node_id)
-
-            if args.use_process_isolation:
-                pending_class_types = set()
-                for node_id in execution_list.pendingNodes.keys():
-                    class_type = dynamic_prompt.get_node(node_id)["class_type"]
-                    pending_class_types.add(class_type)
+        if args.use_process_isolation:
+            try:
+                # Boundary cleanup runs at the start of the next workflow in
+                # isolation mode, matching non-isolated "next prompt" timing.
+                self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)
                 await self._wait_model_patcher_quiescence_safe(
-                    fail_loud=True,
+                    fail_loud=False,
                     timeout_ms=120000,
-                    marker="EX:notify_graph_wait_idle",
+                    marker="EX:boundary_cleanup_wait_idle",
                 )
-                await self._notify_execution_graph_safe(pending_class_types, fail_loud=True)
-
-            while not execution_list.is_empty():
-                node_id, error, ex = await execution_list.stage_node_execution()
-                if error is not None:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
-                    break
-
-                assert node_id is not None, "Node ID should not be None at this point"
-                result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs)
-                self.success = result != ExecutionResult.FAILURE
-                if result == ExecutionResult.FAILURE:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
-                    break
-                elif result == ExecutionResult.PENDING:
-                    execution_list.unstage_node_execution()
-                else: # result == ExecutionResult.SUCCESS:
-                    execution_list.complete_node_execution()
-                self.caches.outputs.poll(ram_headroom=self.cache_args["ram"])
-            else:
-                # Only execute when the while-loop ends without break
-                self.add_message("execution_success", { "prompt_id": prompt_id }, broadcast=False)
-
-            ui_outputs = {}
-            meta_outputs = {}
-            for node_id, ui_info in ui_node_outputs.items():
-                ui_outputs[node_id] = ui_info["output"]
-                meta_outputs[node_id] = ui_info["meta"]
-            self.history_result = {
-                "outputs": ui_outputs,
-                "meta": meta_outputs,
-            }
-            comfy.model_management.cleanup_models_gc()
-            self.server.last_node_id = None
-            if comfy.model_management.DISABLE_SMART_MEMORY:
+                await self._flush_running_extensions_transport_state_safe()
                 comfy.model_management.unload_all_models()
+                comfy.model_management.cleanup_models_gc()
+                comfy.model_management.cleanup_models()
+                gc.collect()
+                comfy.model_management.soft_empty_cache()
+            except Exception:
+                logging.debug("][ EX:isolation_boundary_cleanup_start failed", exc_info=True)
+
+        self._notify_prompt_lifecycle("start", prompt_id)
+
+        try:
+            with torch.inference_mode():
+                dynamic_prompt = DynamicPrompt(prompt)
+                reset_progress_state(prompt_id, dynamic_prompt)
+                add_progress_handler(WebUIProgressHandler(self.server))
+                is_changed_cache = IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)
+                for cache in self.caches.all:
+                    await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+                    cache.clean_unused()
+
+                node_ids = list(prompt.keys())
+                cache_results = await asyncio.gather(
+                    *(self.caches.outputs.get(node_id) for node_id in node_ids)
+                )
+                cached_nodes = [
+                    node_id for node_id, result in zip(node_ids, cache_results)
+                    if result is not None
+                ]
+
+                comfy.model_management.cleanup_models_gc()
+                self.add_message("execution_cached",
+                              { "nodes": cached_nodes, "prompt_id": prompt_id},
+                              broadcast=False)
+                pending_subgraph_results = {}
+                pending_async_nodes = {} # TODO - Unify this with pending_subgraph_results
+                ui_node_outputs = {}
+                executed = set()
+                execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
+                current_outputs = self.caches.outputs.all_node_ids()
+                for node_id in list(execute_outputs):
+                    execution_list.add_node(node_id)
+
+                if args.use_process_isolation:
+                    pending_class_types = set()
+                    for node_id in execution_list.pendingNodes.keys():
+                        class_type = dynamic_prompt.get_node(node_id)["class_type"]
+                        pending_class_types.add(class_type)
+                    await self._wait_model_patcher_quiescence_safe(
+                        fail_loud=True,
+                        timeout_ms=120000,
+                        marker="EX:notify_graph_wait_idle",
+                    )
+                    await self._notify_execution_graph_safe(pending_class_types, fail_loud=True)
+
+                while not execution_list.is_empty():
+                    node_id, error, ex = await execution_list.stage_node_execution()
+                    if error is not None:
+                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                        break
+
+                    assert node_id is not None, "Node ID should not be None at this point"
+                    result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs)
+                    self.success = result != ExecutionResult.FAILURE
+                    if result == ExecutionResult.FAILURE:
+                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                        break
+                    elif result == ExecutionResult.PENDING:
+                        execution_list.unstage_node_execution()
+                    else: # result == ExecutionResult.SUCCESS:
+                        execution_list.complete_node_execution()
+                    self.caches.outputs.poll(ram_headroom=self.cache_args["ram"])
+                else:
+                    # Only execute when the while-loop ends without break
+                    self.add_message("execution_success", { "prompt_id": prompt_id }, broadcast=False)
+
+                ui_outputs = {}
+                meta_outputs = {}
+                for node_id, ui_info in ui_node_outputs.items():
+                    ui_outputs[node_id] = ui_info["output"]
+                    meta_outputs[node_id] = ui_info["meta"]
+                self.history_result = {
+                    "outputs": ui_outputs,
+                    "meta": meta_outputs,
+                }
+                self.server.last_node_id = None
+                if comfy.model_management.DISABLE_SMART_MEMORY:
+                    comfy.model_management.unload_all_models()
+        finally:
+            self._notify_prompt_lifecycle("end", prompt_id)
 
 
 async def validate_inputs(prompt_id, prompt, item, validated):
