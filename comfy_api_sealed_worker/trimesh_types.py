@@ -99,7 +99,7 @@ class TrimeshData:
     def to_trimesh(self):
         """Convert to trimesh.Trimesh (requires trimesh in the environment)."""
         import trimesh
-        from trimesh.visual import TextureVisuals, ColorVisuals
+        from trimesh.visual import TextureVisuals
 
         kwargs = {}
         if self.vertex_normals is not None:
