@@ -24,6 +24,49 @@ CACHE_SUBDIR = "cache"
 CACHE_KEY_FILE = "cache_key"
 CACHE_DATA_FILE = "node_info.json"
 CACHE_KEY_LENGTH = 16
+_NESTED_SCAN_ROOT = "packages"
+_IGNORED_MANIFEST_DIRS = {".git", ".venv", "__pycache__"}
+
+
+def _read_manifest(manifest_path: Path) -> dict[str, Any] | None:
+    try:
+        with manifest_path.open("rb") as f:
+            data = tomllib.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return None
+    return None
+
+
+def _is_isolation_manifest(data: dict[str, Any]) -> bool:
+    return (
+        "tool" in data
+        and "comfy" in data["tool"]
+        and "isolation" in data["tool"]["comfy"]
+    )
+
+
+def _discover_nested_manifests(entry: Path) -> List[Tuple[Path, Path]]:
+    packages_root = entry / _NESTED_SCAN_ROOT
+    if not packages_root.exists() or not packages_root.is_dir():
+        return []
+
+    nested: List[Tuple[Path, Path]] = []
+    for manifest in sorted(packages_root.rglob("pyproject.toml")):
+        node_dir = manifest.parent
+        if any(part in _IGNORED_MANIFEST_DIRS for part in node_dir.parts):
+            continue
+
+        data = _read_manifest(manifest)
+        if not data or not _is_isolation_manifest(data):
+            continue
+
+        isolation = data["tool"]["comfy"]["isolation"]
+        if isolation.get("standalone") is True:
+            nested.append((node_dir, manifest))
+
+    return nested
 
 
 def find_manifest_directories() -> List[Tuple[Path, Path]]:
@@ -45,20 +88,12 @@ def find_manifest_directories() -> List[Tuple[Path, Path]]:
             if not manifest.exists():
                 continue
 
-            # Validate [tool.comfy.isolation] section existence
-            try:
-                with manifest.open("rb") as f:
-                    data = tomllib.load(f)
-
-                if (
-                    "tool" in data
-                    and "comfy" in data["tool"]
-                    and "isolation" in data["tool"]["comfy"]
-                ):
-                    manifest_dirs.append((entry, manifest))
-
-            except Exception:
+            data = _read_manifest(manifest)
+            if not data or not _is_isolation_manifest(data):
                 continue
+
+            manifest_dirs.append((entry, manifest))
+            manifest_dirs.extend(_discover_nested_manifests(entry))
 
     return manifest_dirs
 

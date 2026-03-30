@@ -8,14 +8,13 @@ import sys
 import types
 import platform
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import pyisolate
 from pyisolate import ExtensionManager, ExtensionManagerConfig
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
-from .extension_wrapper import ComfyNodeExtension
 from .manifest_loader import is_cache_valid, load_from_cache, save_to_cache
 from .host_policy import load_host_policy
 
@@ -42,7 +41,11 @@ def _register_web_directory(extension_name: str, node_dir: Path) -> None:
                 web_dir_path = str(node_dir / web_dir_name)
                 if os.path.isdir(web_dir_path):
                     nodes.EXTENSION_WEB_DIRS[extension_name] = web_dir_path
-                    logger.debug("][ Registered web dir for isolated %s: %s", extension_name, web_dir_path)
+                    logger.debug(
+                        "][ Registered web dir for isolated %s: %s",
+                        extension_name,
+                        web_dir_path,
+                    )
                     return
         except Exception:
             pass
@@ -62,15 +65,26 @@ def _register_web_directory(extension_name: str, node_dir: Path) -> None:
                         web_dir_path = str((node_dir / value).resolve())
                         if os.path.isdir(web_dir_path):
                             nodes.EXTENSION_WEB_DIRS[extension_name] = web_dir_path
-                            logger.debug("][ Registered web dir for isolated %s: %s", extension_name, web_dir_path)
+                            logger.debug(
+                                "][ Registered web dir for isolated %s: %s",
+                                extension_name,
+                                web_dir_path,
+                            )
                             return
         except Exception:
             pass
 
 
-async def _stop_extension_safe(
-    extension: ComfyNodeExtension, extension_name: str
-) -> None:
+def _get_extension_type(execution_model: str) -> type[Any]:
+    if execution_model == "sealed_worker":
+        return pyisolate.SealedNodeExtension
+
+    from .extension_wrapper import ComfyNodeExtension
+
+    return ComfyNodeExtension
+
+
+async def _stop_extension_safe(extension: Any, extension_name: str) -> None:
     try:
         stop_result = extension.stop()
         if inspect.isawaitable(stop_result):
@@ -126,12 +140,18 @@ def _parse_cuda_wheels_config(
     if raw_config is None:
         return None
     if not isinstance(raw_config, dict):
-        raise ExtensionLoadError(
-            "[tool.comfy.isolation.cuda_wheels] must be a table"
-        )
+        raise ExtensionLoadError("[tool.comfy.isolation.cuda_wheels] must be a table")
 
     index_url = raw_config.get("index_url")
-    if not isinstance(index_url, str) or not index_url.strip():
+    index_urls = raw_config.get("index_urls")
+    if index_urls is not None:
+        if not isinstance(index_urls, list) or not all(
+            isinstance(u, str) and u.strip() for u in index_urls
+        ):
+            raise ExtensionLoadError(
+                "[tool.comfy.isolation.cuda_wheels.index_urls] must be a list of non-empty strings"
+            )
+    elif not isinstance(index_url, str) or not index_url.strip():
         raise ExtensionLoadError(
             "[tool.comfy.isolation.cuda_wheels.index_url] must be a non-empty string"
         )
@@ -187,11 +207,15 @@ def _parse_cuda_wheels_config(
             )
         normalized_package_map[canonical_dependency_name] = index_package_name.strip()
 
-    return {
-        "index_url": index_url.rstrip("/") + "/",
+    result: dict = {
         "packages": normalized_packages,
         "package_map": normalized_package_map,
     }
+    if index_urls is not None:
+        result["index_urls"] = [u.rstrip("/") + "/" for u in index_urls]
+    else:
+        result["index_url"] = index_url.rstrip("/") + "/"
+    return result
 
 
 def get_enforcement_policy() -> Dict[str, bool]:
@@ -228,7 +252,7 @@ async def load_isolated_node(
     node_dir: Path,
     manifest_path: Path,
     logger: logging.Logger,
-    build_stub_class: Callable[[str, Dict[str, object], ComfyNodeExtension], type],
+    build_stub_class: Callable[[str, Dict[str, object], Any], type],
     venv_root: Path,
     extension_managers: List[ExtensionManager],
 ) -> List[Tuple[str, str, type]]:
@@ -243,6 +267,31 @@ async def load_isolated_node(
     tool_config = manifest_data.get("tool", {}).get("comfy", {}).get("isolation", {})
     can_isolate = tool_config.get("can_isolate", False)
     share_torch = tool_config.get("share_torch", False)
+    package_manager = tool_config.get("package_manager", "uv")
+    is_conda = package_manager == "conda"
+    execution_model = tool_config.get("execution_model")
+    if execution_model is None:
+        execution_model = "sealed_worker" if is_conda else "host-coupled"
+
+    if "sealed_host_ro_paths" in tool_config:
+        raise ValueError(
+            "Manifest field 'sealed_host_ro_paths' is not allowed. "
+            "Configure [tool.comfy.host].sealed_worker_ro_import_paths in host policy."
+        )
+
+    # Conda-specific manifest fields
+    conda_channels: list[str] = (
+        tool_config.get("conda_channels", []) if is_conda else []
+    )
+    conda_dependencies: list[str] = (
+        tool_config.get("conda_dependencies", []) if is_conda else []
+    )
+    conda_platforms: list[str] = (
+        tool_config.get("conda_platforms", []) if is_conda else []
+    )
+    conda_python: str = (
+        tool_config.get("conda_python", "*") if is_conda else "*"
+    )
 
     # Parse [project] dependencies
     project_config = manifest_data.get("project", {})
@@ -260,8 +309,6 @@ async def load_isolated_node(
     if not isolated:
         return []
 
-    logger.info(f"][ Loading isolated node: {extension_name}")
-
     import folder_paths
 
     base_paths = [Path(folder_paths.base_path), node_dir]
@@ -272,8 +319,9 @@ async def load_isolated_node(
     cuda_wheels = _parse_cuda_wheels_config(tool_config, dependencies)
 
     manager_config = ExtensionManagerConfig(venv_root_path=str(venv_root))
+    extension_type = _get_extension_type(execution_model)
     manager: ExtensionManager = pyisolate.ExtensionManager(
-        ComfyNodeExtension, manager_config
+        extension_type, manager_config
     )
     extension_managers.append(manager)
 
@@ -281,15 +329,21 @@ async def load_isolated_node(
 
     sandbox_config = {}
     is_linux = platform.system() == "Linux"
+
+    if is_conda:
+        share_torch = False
+        share_cuda_ipc = False
+    else:
+        share_cuda_ipc = share_torch and is_linux
+
     if is_linux and isolated:
         sandbox_config = {
             "network": host_policy["allow_network"],
             "writable_paths": host_policy["writable_paths"],
             "readonly_paths": host_policy["readonly_paths"],
         }
-    share_cuda_ipc = share_torch and is_linux
 
-    extension_config = {
+    extension_config: dict = {
         "name": extension_name,
         "module_path": str(node_dir),
         "isolated": True,
@@ -299,16 +353,59 @@ async def load_isolated_node(
         "sandbox_mode": host_policy["sandbox_mode"],
         "sandbox": sandbox_config,
     }
+
+    _is_sealed = execution_model == "sealed_worker"
+    _is_sandboxed = host_policy["sandbox_mode"] != "disabled" and is_linux
+    logger.info(
+        "][ Loading isolated node: %s (torch_share [%s], sealed [%s], sandboxed [%s])",
+        extension_name,
+        "x" if share_torch else " ",
+        "x" if _is_sealed else " ",
+        "x" if _is_sandboxed else " ",
+    )
+
     if cuda_wheels is not None:
         extension_config["cuda_wheels"] = cuda_wheels
 
+    # Conda-specific keys
+    if is_conda:
+        extension_config["package_manager"] = "conda"
+        extension_config["conda_channels"] = conda_channels
+        extension_config["conda_dependencies"] = conda_dependencies
+        extension_config["conda_python"] = conda_python
+        find_links = tool_config.get("find_links", [])
+        if find_links:
+            extension_config["find_links"] = find_links
+        if conda_platforms:
+            extension_config["conda_platforms"] = conda_platforms
+
+    if execution_model != "host-coupled":
+        extension_config["execution_model"] = execution_model
+    if execution_model == "sealed_worker":
+        policy_ro_paths = host_policy.get("sealed_worker_ro_import_paths", [])
+        if isinstance(policy_ro_paths, list) and policy_ro_paths:
+            extension_config["sealed_host_ro_paths"] = list(policy_ro_paths)
+        # Sealed workers keep the host RPC service inventory even when the
+        # child resolves no API classes locally.
+
     extension = manager.load_extension(extension_config)
     register_dummy_module(extension_name, node_dir)
+
+    # Register host-side event handlers via adapter
+    from .adapter import ComfyUIAdapter
+    ComfyUIAdapter.register_host_event_handlers(extension)
 
     # Register web directory on the host — only when sandbox is disabled.
     # In sandbox mode, serving untrusted JS to the browser is not safe.
     if host_policy["sandbox_mode"] == "disabled":
         _register_web_directory(extension_name, node_dir)
+
+    # Register for proxied web serving — the child's web dir may have
+    # content that doesn't exist on the host (e.g., pip-installed viewer
+    # bundles). The WebDirectoryCache will lazily fetch via RPC.
+    from .proxies.web_directory_proxy import WebDirectoryProxy, get_web_directory_cache
+    cache = get_web_directory_cache()
+    cache.register_proxy(extension_name, WebDirectoryProxy())
 
     # Try cache first (lazy spawn)
     if is_cache_valid(node_dir, manifest_path, venv_root):
@@ -378,6 +475,10 @@ async def load_isolated_node(
     # Save metadata to cache for future runs
     save_to_cache(node_dir, venv_root, cache_data, manifest_path)
     logger.debug(f"][ {extension_name} metadata cached")
+
+    # Re-check web directory AFTER child has populated it
+    if host_policy["sandbox_mode"] == "disabled":
+        _register_web_directory(extension_name, node_dir)
 
     # EJECT: Kill process after getting metadata (will respawn on first execution)
     await _stop_extension_safe(extension, extension_name)

@@ -37,6 +37,88 @@ _PRE_EXEC_MIN_FREE_VRAM_BYTES = 2 * 1024 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
+def _run_prestartup_web_copy(module: Any, module_dir: str, web_dir_path: str) -> None:
+    """Run the web asset copy step that prestartup_script.py used to do.
+
+    If the module's web/ directory is empty and the module had a
+    prestartup_script.py that copied assets from pip packages, this
+    function replicates that work inside the child process.
+
+    Generic pattern: reads _PRESTARTUP_WEB_COPY from the module if
+    defined, otherwise falls back to detecting common asset packages.
+    """
+    import shutil
+
+    # Already populated — nothing to do
+    if os.path.isdir(web_dir_path) and any(os.scandir(web_dir_path)):
+        return
+
+    os.makedirs(web_dir_path, exist_ok=True)
+
+    # Try module-defined copy spec first (generic hook for any node pack)
+    copy_spec = getattr(module, "_PRESTARTUP_WEB_COPY", None)
+    if copy_spec is not None and callable(copy_spec):
+        try:
+            copy_spec(web_dir_path)
+            logger.info(
+                "%s Ran _PRESTARTUP_WEB_COPY for %s", LOG_PREFIX, module_dir
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                "%s _PRESTARTUP_WEB_COPY failed for %s: %s",
+                LOG_PREFIX, module_dir, e,
+            )
+
+    # Fallback: detect comfy_3d_viewers and run copy_viewer()
+    try:
+        from comfy_3d_viewers import copy_viewer, VIEWER_FILES
+        viewers = list(VIEWER_FILES.keys())
+        for viewer in viewers:
+            try:
+                copy_viewer(viewer, web_dir_path)
+            except Exception:
+                pass
+        if any(os.scandir(web_dir_path)):
+            logger.info(
+                "%s Copied %d viewer types from comfy_3d_viewers to %s",
+                LOG_PREFIX, len(viewers), web_dir_path,
+            )
+    except ImportError:
+        pass
+
+    # Fallback: detect comfy_dynamic_widgets
+    try:
+        from comfy_dynamic_widgets import get_js_path
+        src = os.path.realpath(get_js_path())
+        if os.path.exists(src):
+            dst_dir = os.path.join(web_dir_path, "js")
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, "dynamic_widgets.js")
+            shutil.copy2(src, dst)
+    except ImportError:
+        pass
+
+
+def _read_extension_name(module_dir: str) -> str:
+    """Read extension name from pyproject.toml, falling back to directory name."""
+    pyproject = os.path.join(module_dir, "pyproject.toml")
+    if os.path.exists(pyproject):
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
+        try:
+            with open(pyproject, "rb") as f:
+                data = tomllib.load(f)
+            name = data.get("project", {}).get("name")
+            if name:
+                return name
+        except Exception:
+            pass
+    return os.path.basename(module_dir)
+
+
 def _flush_tensor_transport_state(marker: str) -> int:
     try:
         from pyisolate import flush_tensor_keeper  # type: ignore[attr-defined]
@@ -129,6 +211,20 @@ class ComfyNodeExtension(ExtensionBase):
 
         self.node_classes = getattr(module, "NODE_CLASS_MAPPINGS", {}) or {}
         self.display_names = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {}) or {}
+
+        # Register web directory with WebDirectoryProxy (child-side)
+        web_dir_attr = getattr(module, "WEB_DIRECTORY", None)
+        if web_dir_attr is not None:
+            module_dir = os.path.dirname(os.path.abspath(module.__file__))
+            web_dir_path = os.path.abspath(os.path.join(module_dir, web_dir_attr))
+            ext_name = _read_extension_name(module_dir)
+
+            # If web dir is empty, run the copy step that prestartup_script.py did
+            _run_prestartup_web_copy(module, module_dir, web_dir_path)
+
+            if os.path.isdir(web_dir_path) and any(os.scandir(web_dir_path)):
+                from comfy.isolation.proxies.web_directory_proxy import WebDirectoryProxy
+                WebDirectoryProxy.register_web_dir(ext_name, web_dir_path)
 
         try:
             from comfy_api.latest import ComfyExtension
@@ -365,6 +461,12 @@ class ComfyNodeExtension(ExtensionBase):
                 for key, value in hidden_found.items():
                     setattr(node_cls.hidden, key.value.lower(), value)
 
+        # INPUT_IS_LIST: ComfyUI's executor passes all inputs as lists when this
+        # flag is set.  The isolation RPC delivers unwrapped values, so we must
+        # wrap each input in a single-element list to match the contract.
+        if getattr(node_cls, "INPUT_IS_LIST", False):
+            resolved_inputs = {k: [v] for k, v in resolved_inputs.items()}
+
         function_name = getattr(node_cls, "FUNCTION", "execute")
         if not hasattr(instance, function_name):
             raise AttributeError(f"Node {node_name} missing callable '{function_name}'")
@@ -402,7 +504,7 @@ class ComfyNodeExtension(ExtensionBase):
                 "args": self._wrap_unpicklable_objects(result.args),
             }
             if result.ui is not None:
-                node_output_dict["ui"] = result.ui
+                node_output_dict["ui"] = self._wrap_unpicklable_objects(result.ui)
             if getattr(result, "expand", None) is not None:
                 node_output_dict["expand"] = result.expand
             if getattr(result, "block_execution", None) is not None:
@@ -453,6 +555,85 @@ class ComfyNodeExtension(ExtensionBase):
             raise KeyError(f"Remote object {object_id} not found")
 
         return self.remote_objects[object_id]
+
+    def _store_remote_object_handle(self, obj: Any) -> RemoteObjectHandle:
+        object_id = str(uuid.uuid4())
+        self.remote_objects[object_id] = obj
+        return RemoteObjectHandle(object_id, type(obj).__name__)
+
+    async def call_remote_object_method(
+        self,
+        object_id: str,
+        method_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Invoke a method or attribute-backed accessor on a child-owned object."""
+        obj = await self.get_remote_object(object_id)
+
+        if method_name == "get_patcher_attr":
+            return getattr(obj, args[0])
+        if method_name == "get_model_options":
+            return getattr(obj, "model_options")
+        if method_name == "set_model_options":
+            setattr(obj, "model_options", args[0])
+            return None
+        if method_name == "get_object_patches":
+            return getattr(obj, "object_patches")
+        if method_name == "get_patches":
+            return getattr(obj, "patches")
+        if method_name == "get_wrappers":
+            return getattr(obj, "wrappers")
+        if method_name == "get_callbacks":
+            return getattr(obj, "callbacks")
+        if method_name == "get_load_device":
+            return getattr(obj, "load_device")
+        if method_name == "get_offload_device":
+            return getattr(obj, "offload_device")
+        if method_name == "get_hook_mode":
+            return getattr(obj, "hook_mode")
+        if method_name == "get_parent":
+            parent = getattr(obj, "parent", None)
+            if parent is None:
+                return None
+            return self._store_remote_object_handle(parent)
+        if method_name == "get_inner_model_attr":
+            attr_name = args[0]
+            if hasattr(obj.model, attr_name):
+                return getattr(obj.model, attr_name)
+            if hasattr(obj, attr_name):
+                return getattr(obj, attr_name)
+            return None
+        if method_name == "inner_model_apply_model":
+            return obj.model.apply_model(*args[0], **args[1])
+        if method_name == "inner_model_extra_conds_shapes":
+            return obj.model.extra_conds_shapes(*args[0], **args[1])
+        if method_name == "inner_model_extra_conds":
+            return obj.model.extra_conds(*args[0], **args[1])
+        if method_name == "inner_model_memory_required":
+            return obj.model.memory_required(*args[0], **args[1])
+        if method_name == "process_latent_in":
+            return obj.model.process_latent_in(*args[0], **args[1])
+        if method_name == "process_latent_out":
+            return obj.model.process_latent_out(*args[0], **args[1])
+        if method_name == "scale_latent_inpaint":
+            return obj.model.scale_latent_inpaint(*args[0], **args[1])
+        if method_name.startswith("get_"):
+            attr_name = method_name[4:]
+            if hasattr(obj, attr_name):
+                return getattr(obj, attr_name)
+
+        target = getattr(obj, method_name)
+        if callable(target):
+            result = target(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            if type(result).__name__ == "ModelPatcher":
+                return self._store_remote_object_handle(result)
+            return result
+        if args or kwargs:
+            raise TypeError(f"{method_name} is not callable on remote object {object_id}")
+        return target
 
     def _wrap_unpicklable_objects(self, data: Any) -> Any:
         if isinstance(data, (str, int, float, bool, type(None))):
@@ -514,9 +695,7 @@ class ComfyNodeExtension(ExtensionBase):
             if serializer:
                 return serializer(data)
 
-        object_id = str(uuid.uuid4())
-        self.remote_objects[object_id] = data
-        return RemoteObjectHandle(object_id, type(data).__name__)
+        return self._store_remote_object_handle(data)
 
     def _resolve_remote_objects(self, data: Any) -> Any:
         if isinstance(data, RemoteObjectHandle):
